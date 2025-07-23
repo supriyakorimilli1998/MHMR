@@ -1,5 +1,4 @@
-
-# --- IMPORTS ---
+# --- IMPORTS ---loading as  a table format
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring
 from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
@@ -169,7 +168,7 @@ def load_table(table_name, key_column):
 
         # Filter out already processed UTCs
         try:
-            main_log_df = spark.read.table("history_final_logs")
+            main_log_df = spark.read.table("final_history_logs")
             processed_utcs = main_log_df.filter(
                 (col("table_name") == table_name) & col("status").isin("D", "I", "U")
             ).select("UTCTimestamp").rdd.flatMap(lambda x: x).collect()
