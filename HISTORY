@@ -1,6 +1,6 @@
 # --- IMPORTS ---loading as  a table format
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -11,6 +11,7 @@ import traceback
 
 # === INIT SPARK SESSION ===
 spark = SparkSession.builder.appName("Process History Tables").getOrCreate()
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
@@ -190,8 +191,17 @@ def load_table(table_name, key_column):
         for utc in utc_timestamps:
             print(f"\n-- FUNCTION load_table: [PROCESSING] {table_name} | UTC: {utc} --")
             try:
-                insert_view = insert_df.filter(col("UTCTimestamp") == utc).withColumn("flag", lit("A"))
-                update_view = update_df.filter(col("UTCTimestamp") == utc).withColumn("flag", lit("A"))
+        
+                insert_view = insert_df.filter(col("UTCTimestamp") == utc) \
+                    .drop("insert_timestamp") \
+                    .withColumn("flag", lit("A")) \
+                    .withColumn("insert_timestamp", current_timestamp())
+
+                update_view = update_df.filter(col("UTCTimestamp") == utc) \
+                    .drop("insert_timestamp") \
+                    .withColumn("flag", lit("A")) \
+                    .withColumn("insert_timestamp", current_timestamp())
+
                 delete_view = delete_df.filter(col("UTCTimestamp") == utc)
 
                 # Handle deletes
