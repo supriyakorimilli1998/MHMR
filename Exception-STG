@@ -1,0 +1,166 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, lit, current_timestamp
+from datetime import datetime
+import pytz
+
+# === INIT SPARK SESSION ===
+spark = SparkSession.builder.appName("Process History Tables").getOrCreate()
+
+# Spark config variables
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# === CONFIG ===
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+
+# === LOGGING FUNCTION ===
+def log_staging_activity(run_date, table_name, operation, status, count, error_message=None):
+    log_df = spark.createDataFrame([
+        (run_date, table_name, operation, status, count, error_message, datetime.now(tz))
+    ], ["run_date", "table_name", "operation", "status", "count", "error_message", "insert_timestamp"])
+    log_df.write.mode("append").saveAsTable("staging.staging_log")
+
+# === FUNCTIONS ===
+def load_table_metadata():
+    return spark.read.table("TABLES_LIST")
+
+def safe_load_prev_raw_table(table_name):
+    try:
+        raw_prev_table = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+        return spark.read.table(raw_prev_table).alias("prev")
+    except Exception:
+        return None
+
+def build_join_condition(df1_alias, df2_alias, key_columns):
+    return [col(f"{df1_alias}.{k}") == col(f"{df2_alias}.{k}") for k in key_columns]
+
+def detect_inserts_updates(raw_df, raw_prev_df, key_columns, row_hash_col, table_name):
+    join_condition = build_join_condition("raw", "prev", key_columns)
+    joined_df = raw_df.alias("raw").join(raw_prev_df.alias("prev"), on=join_condition, how="left")
+    comparison_df = joined_df.withColumn(
+        "status",
+        when(col(f"prev.{key_columns[0]}").isNull(), lit("I"))
+        .when(col(f"raw.{row_hash_col}") != col(f"prev.{row_hash_col}"), lit("U"))
+        .otherwise(lit(None))
+    ).filter(col("status").isNotNull())
+    raw_cols = raw_df.columns
+    comparison_df = comparison_df.select([f"raw.{c}" for c in raw_cols] + ["status"]) \
+        .withColumn("insert_ts", current_timestamp()) \
+        .withColumn("source_table", lit(table_name))
+    return comparison_df
+
+def detect_deletes(raw_df, raw_prev_df, key_columns, table_name):
+    join_condition = build_join_condition("prev", "raw", key_columns)
+    delete_df = raw_prev_df.alias("prev").join(raw_df.alias("raw"), on=join_condition, how="left_anti")
+    raw_cols = raw_df.columns
+    delete_df = delete_df.select([f"prev.{c}" for c in raw_cols]) \
+        .withColumn("status", lit("D")) \
+        .withColumn("insert_ts", current_timestamp()) \
+        .withColumn("source_table", lit(table_name))
+    return delete_df
+
+def write_to_temp_staging(df, table_name):
+    temp_staging_table = f"staging.temp_stg_{table_name}"
+    try:
+        status_counts = df.groupBy("status").count().collect()
+        for row in status_counts:
+            log_staging_activity(
+                run_date=Today_date,
+                table_name=table_name,
+                operation=row['status'],
+                status="Succeeded",
+                count=row['count']
+            )
+        df.write.mode("overwrite").saveAsTable(temp_staging_table)
+    except Exception as e:
+        log_staging_activity(
+            run_date=Today_date,
+            table_name=table_name,
+            operation="Unknown",
+            status="Failed",
+            count=0,
+            error_message=str(e)
+        )
+        raise
+
+def finalize_staging_table(table_name):
+    temp_staging_table = f"staging.temp_stg_{table_name}"
+    final_staging_table = f"staging.stg_{table_name}"
+    try:
+        temp_df = spark.read.table(temp_staging_table)
+        temp_count = temp_df.count()
+        if temp_count > 0:
+            spark.sql(f"DROP TABLE IF EXISTS {final_staging_table}")
+            spark.sql(f"CREATE TABLE {final_staging_table} AS SELECT * FROM {temp_staging_table}")
+            spark.sql(f"DROP TABLE IF EXISTS {temp_staging_table}")
+    except Exception as e:
+        raise
+
+def move_raw_to_prev_raw(table_name):
+    raw_table = f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW"
+    prev_raw_table = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+    raw_df = spark.read.table(raw_table)
+    raw_df.write.mode("overwrite").saveAsTable(prev_raw_table)
+
+def snapshot_prev_raw_table(table_name):
+    snapshot_table = f"MHMR_LAKEHOUSE.PREV_RAW_SNAPSHOT.{table_name}_RAW_PREV_{Today_date.strftime('%Y%m%d')}"
+    prev_raw_table = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+    prev_raw_df = spark.read.table(prev_raw_table)
+    prev_raw_df.write.mode("overwrite").saveAsTable(snapshot_table)
+
+def process_all_tables():
+    tables_list_df = load_table_metadata()
+    success = True
+    processed_tables = []
+    for row in tables_list_df.collect():
+        table_name = row['TABLE_NAME']
+        key_columns = row['KEY_COLUMN'].split(',')
+        row_hash_col = "row_hash"
+        try:
+            raw_df = spark.read.table(f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW").alias("raw")
+            raw_prev_df = safe_load_prev_raw_table(table_name)
+            if raw_prev_df is None or raw_prev_df.rdd.isEmpty():
+                changes_df = raw_df.withColumn("status", lit("I")) \
+                    .withColumn("insert_ts", current_timestamp()) \
+                    .withColumn("source_table", lit(table_name))
+            else:
+                changes_df = detect_inserts_updates(raw_df, raw_prev_df, key_columns, row_hash_col, table_name)
+                deletes_df = detect_deletes(raw_df, raw_prev_df, key_columns, table_name)
+                final_cols = changes_df.columns
+                if deletes_df.rdd.isEmpty():
+                    log_staging_activity(
+                        run_date=Today_date,
+                        table_name=table_name,
+                        operation="D",
+                        status="Succeeded",
+                        count=0
+                    )
+                else:
+                    deletes_df = deletes_df.select(final_cols)
+                    changes_df = changes_df.unionByName(deletes_df)
+            write_to_temp_staging(changes_df, table_name)
+            processed_tables.append(table_name)
+        except Exception as e:
+            log_staging_activity(
+                run_date=Today_date,
+                table_name=table_name,
+                operation="Unknown",
+                status="Failed",
+                count=0,
+                error_message=str(e)
+            )
+            success = False
+            break
+    if success:
+        for table_name in processed_tables:
+            finalize_staging_table(table_name)
+            move_raw_to_prev_raw(table_name)
+            snapshot_prev_raw_table(table_name)
+
+# === RUN ===
+process_all_tables()
