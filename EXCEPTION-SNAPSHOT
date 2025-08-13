@@ -23,16 +23,38 @@ def apply_snapshot_for_table(table_name, key_cols):
 
         snap = spark.read.table(snap_tbl(table_name))
 
+        # Clean column list (drop temp)
         all_cols = [c for c in stg_today.columns if c != "_ins_local_dt"]
 
-        stg_keys_all = stg_today.select(*key_cols).dropDuplicates()
-        snap_keys = snap.select(*key_cols).dropDuplicates()
-
+        # Separate INSERT and UPDATE from today's staging
         stg_I = stg_today.filter(F.upper(F.col(status_col)) == F.lit("I"))
         stg_U = stg_today.filter(F.upper(F.col(status_col)) == F.lit("U"))
 
-        # === DELETES ===
+        snap_keys = snap.select(*key_cols).dropDuplicates()
+
+        # INSERT rows = 'I' rows NOT in snapshot
+        start_i = datetime.now(tz)
+        i_src = (stg_I.alias("s")
+                 .join(snap_keys.alias("t"),
+                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
+                       how="left_anti")
+                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
+        i_count = i_src.count()
+        print(f"[{_ts()}] {table_name}: INSERT count = {i_count}")
+
+        # UPDATE rows = 'U' rows where key EXISTS in snapshot
+        start_u = datetime.now(tz)
+        u_src = (stg_U.alias("s")
+                 .join(snap_keys.alias("t"),
+                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
+                       how="inner")
+                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
+        u_count = u_src.count()
+        print(f"[{_ts()}] {table_name}: UPDATE count = {u_count}")
+
+        # DELETE keys = keys in snapshot but not in today's staging (any status)
         start_d = datetime.now(tz)
+        stg_keys_all = stg_today.select(*key_cols).dropDuplicates()
         del_keys = snap_keys.alias("t").join(
             stg_keys_all.alias("s"),
             on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
@@ -49,26 +71,6 @@ def apply_snapshot_for_table(table_name, key_cols):
             """)
         complete_snapshot_daily_log(table_name, "D", d_count, start_d, None)
 
-        # === INSERTS ===
-        start_i = datetime.now(tz)
-        i_src = (stg_I.alias("s")
-                 .join(snap_keys.alias("t"),
-                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
-                       how="left_anti")
-                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
-        i_count = i_src.count()
-        print(f"[{_ts()}] {table_name}: INSERT rows (STATUS='I') = {i_count}")
-
-        # === UPDATES ===
-        start_u = datetime.now(tz)
-        u_src = (stg_U.alias("s")
-                 .join(snap_keys.alias("t"),
-                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
-                       how="inner")
-                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
-        u_count = u_src.count()
-        print(f"[{_ts()}] {table_name}: UPDATE rows (STATUS='U') = {u_count}")
-
         if i_count == 0 and u_count == 0:
             print(f"[{_ts()}] {table_name}: Nothing to MERGE (I=0, U=0).")
             complete_snapshot_daily_log(table_name, "I", 0, start_i, None)
@@ -76,25 +78,24 @@ def apply_snapshot_for_table(table_name, key_cols):
             print(f"[{_ts()}] DONE {table_name} | D={d_count}, I=0, U=0 | Elapsed={(datetime.now(tz)-start_table)}")
             return
 
-        # === MERGE ===
+        # Combine both I + U into one DF with SRC_OP column
         src_df = (i_src.withColumn("SRC_OP", F.lit("I"))
                         .unionByName(u_src.withColumn("SRC_OP", F.lit("U")), allowMissingColumns=False))
         src_df.createOrReplaceTempView("src_union_vw")
 
         on = " AND ".join([f"t.{k}=s.{k}" for k in key_cols])
 
-        # UPDATE clause
+        # MERGE logic: update sets STATUS='U'; insert sets STATUS='I'
         set_expr = []
         for c in all_cols:
             if c.lower() == "status":
                 set_expr.append("t.STATUS = 'U'")
             elif c.lower() == "insert_ts":
-                set_expr.append("t.insert_ts = s.insert_ts")  # Optional: comment if you want to preserve original
+                set_expr.append("t.insert_ts = s.insert_ts")  # Optional: update insert_ts or not
             else:
                 set_expr.append(f"t.{c} = s.{c}")
         set_clause = ", ".join(set_expr)
 
-        # INSERT clause
         insert_cols = ", ".join(all_cols)
         insert_vals = ", ".join(["'I'" if c.lower() == "status" else f"s.{c}" for c in all_cols])
 
@@ -108,6 +109,7 @@ def apply_snapshot_for_table(table_name, key_cols):
               INSERT ({insert_cols}) VALUES ({insert_vals})
         """)
 
+        # Log I/U counts after merge
         complete_snapshot_daily_log(table_name, "I", i_count, start_i, None)
         complete_snapshot_daily_log(table_name, "U", u_count, start_u, None)
 
