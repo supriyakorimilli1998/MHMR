@@ -1,19 +1,19 @@
 def apply_snapshot_for_table(table_name, key_cols):
     start_table = datetime.now(tz)
-    print(f"[{_ts()}] APPLY SNAPSHOT (today only): {table_name} | keys(for D only)={key_cols}")
+    print(f"[{_ts()}] APPLY SNAPSHOT (today only): {table_name} | keys={key_cols}")
 
     try:
         stg_full = spark.read.table(stg_tbl(table_name))
         stg_today = _staging_today(stg_full)  # filter to TODAY
         status_col = _resolve_status_col(stg_full)
 
-        # Ensure snapshot exists (first run + empty-today safe)
+        # Ensure snapshot exists (handles first run + empty-today case)
         boot = ensure_snapshot_exists_from_staging(table_name)
 
         if stg_today.rdd.isEmpty():
             print(f"[{_ts()}] No staging rows for today in {stg_tbl(table_name)}. Logging zeros and continuing.")
             t0 = datetime.now(tz)
-            for s in ("D","I","U"):
+            for s in ("D", "I", "U"):
                 complete_snapshot_daily_log(table_name, s, 0, t0, None)
             return
 
@@ -23,17 +23,21 @@ def apply_snapshot_for_table(table_name, key_cols):
 
         snap = spark.read.table(snap_tbl(table_name))
 
-        # Canonical column order from staging (drop any temp col)
         all_cols = [c for c in stg_today.columns if c != "_ins_local_dt"]
 
-        # --- DELETES: keys in SNAPSHOT but not in TODAY'S STAGING (key used ONLY here)
-        start_d = datetime.now(tz)
         stg_keys_all = stg_today.select(*key_cols).dropDuplicates()
-        snap_keys    = snap.select(*key_cols).dropDuplicates()
-        del_keys = (snap_keys.alias("t")
-                    .join(stg_keys_all.alias("s"),
-                          on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
-                          how="left_anti"))
+        snap_keys = snap.select(*key_cols).dropDuplicates()
+
+        stg_I = stg_today.filter(F.upper(F.col(status_col)) == F.lit("I"))
+        stg_U = stg_today.filter(F.upper(F.col(status_col)) == F.lit("U"))
+
+        # === DELETES ===
+        start_d = datetime.now(tz)
+        del_keys = snap_keys.alias("t").join(
+            stg_keys_all.alias("s"),
+            on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
+            how="left_anti"
+        )
         d_count = del_keys.count()
         print(f"[{_ts()}] {table_name}: DELETE keys count = {d_count}")
         if d_count > 0:
@@ -45,18 +49,25 @@ def apply_snapshot_for_table(table_name, key_cols):
             """)
         complete_snapshot_daily_log(table_name, "D", d_count, start_d, None)
 
-        # --- INSERTS & UPDATES: take as-is from staging by STATUS (no key checks)
+        # === INSERTS ===
         start_i = datetime.now(tz)
-        stg_I = stg_today.filter(F.upper(F.col(status_col)) == F.lit("I")) \
-                         .select([F.col(c) for c in all_cols])
-        i_count = stg_I.count()
-        print(f"[{_ts()}] {table_name}: INSERT rows from staging STATUS='I' (as-is) = {i_count}")
+        i_src = (stg_I.alias("s")
+                 .join(snap_keys.alias("t"),
+                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
+                       how="left_anti")
+                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
+        i_count = i_src.count()
+        print(f"[{_ts()}] {table_name}: INSERT rows (STATUS='I') = {i_count}")
 
+        # === UPDATES ===
         start_u = datetime.now(tz)
-        stg_U = stg_today.filter(F.upper(F.col(status_col)) == F.lit("U")) \
-                         .select([F.col(c) for c in all_cols])
-        u_count = stg_U.count()
-        print(f"[{_ts()}] {table_name}: UPDATE rows from staging STATUS='U' (as-is) = {u_count}")
+        u_src = (stg_U.alias("s")
+                 .join(snap_keys.alias("t"),
+                       on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
+                       how="inner")
+                 .select([F.col(f"s.{c}").alias(c) for c in all_cols]))
+        u_count = u_src.count()
+        print(f"[{_ts()}] {table_name}: UPDATE rows (STATUS='U') = {u_count}")
 
         if i_count == 0 and u_count == 0:
             print(f"[{_ts()}] {table_name}: Nothing to MERGE (I=0, U=0).")
@@ -65,28 +76,38 @@ def apply_snapshot_for_table(table_name, key_cols):
             print(f"[{_ts()}] DONE {table_name} | D={d_count}, I=0, U=0 | Elapsed={(datetime.now(tz)-start_table)}")
             return
 
-        # Build aligned source union (schemas match because both are projected to staging columns)
-        src_union = (stg_I.withColumn("SRC_OP", F.lit("I"))
-                           .unionByName(stg_U.withColumn("SRC_OP", F.lit("U")), allowMissingColumns=False))
-        src_union.createOrReplaceTempView("src_union_vw")
+        # === MERGE ===
+        src_df = (i_src.withColumn("SRC_OP", F.lit("I"))
+                        .unionByName(u_src.withColumn("SRC_OP", F.lit("U")), allowMissingColumns=False))
+        src_df.createOrReplaceTempView("src_union_vw")
 
         on = " AND ".join([f"t.{k}=s.{k}" for k in key_cols])
-        set_clause  = ", ".join([f"t.{c}=s.{c}" for c in all_cols])
-        insert_cols = ", ".join(all_cols)
-        insert_vals = ", ".join([f"s.{c}" for c in all_cols])
 
-        # MERGE: key drives only the join; SRC_OP decides action.
-        # - 'U' updates matched rows
-        # - 'I' inserts not matched rows
+        # UPDATE clause
+        set_expr = []
+        for c in all_cols:
+            if c.lower() == "status":
+                set_expr.append("t.STATUS = 'U'")
+            elif c.lower() == "insert_ts":
+                set_expr.append("t.insert_ts = s.insert_ts")  # Optional: comment if you want to preserve original
+            else:
+                set_expr.append(f"t.{c} = s.{c}")
+        set_clause = ", ".join(set_expr)
+
+        # INSERT clause
+        insert_cols = ", ".join(all_cols)
+        insert_vals = ", ".join(["'I'" if c.lower() == "status" else f"s.{c}" for c in all_cols])
+
         spark.sql(f"""
             MERGE INTO {snap_tbl(table_name)} AS t
             USING (SELECT * FROM src_union_vw) AS s
             ON {on}
-            WHEN MATCHED AND s.SRC_OP = 'U' THEN UPDATE SET {set_clause}
-            WHEN NOT MATCHED AND s.SRC_OP = 'I' THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+            WHEN MATCHED AND s.SRC_OP = 'U' THEN
+              UPDATE SET {set_clause}
+            WHEN NOT MATCHED AND s.SRC_OP = 'I' THEN
+              INSERT ({insert_cols}) VALUES ({insert_vals})
         """)
 
-        # Logs reflect raw staging buckets (as you requested)
         complete_snapshot_daily_log(table_name, "I", i_count, start_i, None)
         complete_snapshot_daily_log(table_name, "U", u_count, start_u, None)
 
