@@ -1,4 +1,4 @@
-# SNAPSHOT
+# SNAPSHOT (CST-aware writes for logs and snapshot tables)
 
 from __future__ import annotations
 from datetime import datetime, date
@@ -15,7 +15,7 @@ from pyspark.sql.utils import AnalysisException
 # ------------------------
 # Spark session & configs
 # ------------------------
-spark = SparkSession.builder.appName("Apply Snapshot Tables - Backfill Aware (Final)").getOrCreate()
+spark = SparkSession.builder.appName("Apply Snapshot Tables - Backfill Aware (Final, CST)").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
@@ -27,6 +27,7 @@ spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED"
 # Constants (adjust as needed)
 # ------------------------
 tz = pytz.timezone("America/Chicago")
+LOCAL_TZ_NAME = "America/Chicago"  # Used in from_utc_timestamp()
 
 CATALOG = "MHMR_LAKEHOUSE"
 SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"
@@ -50,8 +51,8 @@ def snap_tbl(table: str) -> str:
     return f"{SNAPSHOT_SCHEMA}.{table}_SNAPSHOT"
 
 def _local_date_from_ts(col_name: str):
-    """Convert an UTC timestamp column to America/Chicago date."""
-    return F.to_date(F.from_utc_timestamp(F.col(col_name), "America/Chicago"))
+    """Convert a UTC timestamp column to America/Chicago date (for daily partitioning/logic)."""
+    return F.to_date(F.from_utc_timestamp(F.col(col_name), LOCAL_TZ_NAME))
 
 def _resolve_insert_ts_col(df: DataFrame) -> str:
     cols = {c.lower(): c for c in df.columns}
@@ -67,9 +68,21 @@ def _resolve_status_col(df: DataFrame) -> str:
     raise ValueError("STATUS column not found.")
 
 def _staging_on_date(df: DataFrame, d: date) -> DataFrame:
-    """Filter staging rows to the given local date derived from insert_ts."""
+    """Filter staging rows to the given local date derived from insert_ts/insert_timestamp."""
     ts = _resolve_insert_ts_col(df)
     return df.where(_local_date_from_ts(ts) == F.lit(str(d)).cast("date"))
+
+def _convert_to_cst(df: DataFrame, ts_cols: List[str]) -> DataFrame:
+    """
+    Given timestamp columns that are currently UTC instants, return a DF where those
+    columns are represented in America/Chicago via from_utc_timestamp().
+    Handles columns that may be missing (skips them).
+    """
+    out = df
+    for c in ts_cols:
+        if c in out.columns:
+            out = out.withColumn(c, F.from_utc_timestamp(F.col(c), LOCAL_TZ_NAME))
+    return out
 
 # ------------------------
 # Logging (daily reset; final holds history)
@@ -105,14 +118,20 @@ def reset_daily_log() -> None:
 def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
                               cnt: int, start_time: datetime,
                               error_message: str | None = None) -> None:
-    """Append one log row to the daily log."""
+    """
+    Append one log row to the daily log.
+    We create Python datetimes in local tz, Spark ingests them as UTC instants,
+    then we render them in CST via from_utc_timestamp() so the stored wall-times are CST.
+    """
     end_time = datetime.now(tz)
     row_df = spark.createDataFrame(
         [(load_date, table_name, status, int(cnt or 0), error_message,
           end_time, start_time, end_time, "incremental")],
         schema=snap_log_schema
     )
-    row_df.write.mode("append").saveAsTable("LOGS.snapshot_daily_log")
+    # Convert log timestamps to CST before persisting
+    row_df_cst = _convert_to_cst(row_df, ["insert_timestamp", "start_time", "end_time"])
+    row_df_cst.write.mode("append").saveAsTable("LOGS.snapshot_daily_log")
 
 def consolidate_snapshot_logs_to_final(dedupe: bool = True) -> None:
     """
@@ -154,7 +173,6 @@ def processed_success_dates(table_name: str) -> DataFrame:
     except Exception:
         return spark.createDataFrame([], T.StructType([T.StructField("load_date", T.DateType())]))
 
-    # Aggregate error and op presence by date
     agg = (fl.groupBy("load_date")
              .agg(
                  F.sum(F.when(F.col("status") == "E", 1).otherwise(0)).alias("err_rows"),
@@ -186,6 +204,7 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
     - DELETE rows whose keys appear with status='D' (only if key exists in snapshot)
     - INSERT rows with status='I'
     - UPDATE rows with status='U'
+    Snapshot write is CST-normalized for insert_ts / insert_timestamp.
     """
     start_table_date = datetime.now(tz)
     print(f"[{_ts()}] === APPLY SNAPSHOT: {table_name} @ {d} ===")
@@ -214,7 +233,6 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
         snap_cols = snap_df.columns
 
         # --------- DELETE ----------
-        # Count of deletions = rows in snapshot that match keys marked 'D' today
         start_d = datetime.now(tz)
         d_keys = (stg_day.filter(F.upper(F.col(status_col)) == "D")
                          .select(*key_cols).dropDuplicates())
@@ -230,6 +248,7 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
                           .join(touched_keys.alias("s"),
                                 on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
                                 how="left_anti"))
+
         append_snapshot_daily_log(table_name, d, "D", d_count, start_d, None)
         print(f"[{_ts()}] {table_name} {d} -> DELETE count: {d_count}")
 
@@ -256,9 +275,13 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
             print(f"[{_ts()}] {table_name} {d} -> No changes; skipping swap.")
             return
 
+        # ---- CST timestamp normalization for snapshot write ----
+        # If these columns exist, render them to America/Chicago before saving
+        final_df_cst = _convert_to_cst(final_df, ["insert_ts", "insert_timestamp"])
+
         # Write TEMP & atomic swap
-        print(f"[{_ts()}] {table_name} {d} -> Writing TEMP {temp_table}")
-        final_df.write.mode("overwrite").saveAsTable(temp_table)
+        print(f"[{_ts()}] {table_name} {d} -> Writing TEMP {temp_table} (timestamps in CST)")
+        final_df_cst.write.mode("overwrite").saveAsTable(temp_table)
         print(f"[{_ts()}] {table_name} {d} -> Replacing SNAPSHOT {snap_table}")
         spark.sql(f"DROP TABLE IF EXISTS {snap_table}")
         spark.sql(f"ALTER TABLE {temp_table} RENAME TO {snap_table}")
@@ -292,7 +315,7 @@ def _apply_with_retry_for_date(table_name: str, key_cols: List[str], d: date) ->
             time.sleep(SLEEP_BETWEEN_RETRIES)
 
 def process_all_snapshot() -> None:
-    print(f"[{_ts()}] Starting snapshot apply (backfill-aware) ...")
+    print(f"[{_ts()}] Starting snapshot apply (backfill-aware, CST-normalized writes) ...")
     ensure_snapshot_log_tables_exist()
 
     # Daily log is a per-run scratchpad; empty it now
