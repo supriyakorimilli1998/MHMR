@@ -1,1 +1,491 @@
 
+# ========== MHMR HISTORY APPLY (A/I only) – FINAL ==========
+# - Staging helpers: STG_LOAD_DATE (CST), partitioned writes, zero-downtime migration
+# - Shared date helpers (prefer STG_LOAD_DATE, fallback to UTC->CST)
+# - History Apply: logs only 'A'/'I' (no 'E'); exceptions leave dates unprocessed
+# - Log tables partitioned by (table_name, load_date)
+# - Streaming iteration to avoid driver pressure + backfill cap
+
+from __future__ import annotations
+from datetime import datetime, date
+from typing import List, Dict, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import traceback
+import pytz
+
+from pyspark.sql import SparkSession, functions as F, types as T, Window
+from pyspark.sql.dataframe import DataFrame
+from pyspark.sql.utils import AnalysisException
+
+# ------------------------
+# Spark session & configs
+# ------------------------
+spark = SparkSession.builder.appName("MHMR - History Apply (A/I only) - Final").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# ------------------------
+# Constants
+# ------------------------
+tz = pytz.timezone("America/Chicago")
+
+CATALOG = "MHMR_LAKEHOUSE"
+HISTORY_SCHEMA = f"{CATALOG}.HISTORY"
+STAGING_SCHEMA = "staging"
+TABLES_LIST = "TABLES_LIST"     # columns: TABLE_NAME, KEY_COLUMN (comma-separated keys)
+
+MAX_WORKERS = 4
+MAX_RETRIES = 2
+SLEEP_BETWEEN_RETRIES = 5
+MAX_DATES_PER_TABLE = 90        # guardrail for runaway backfills
+
+# ------------------------
+# Small utilities
+# ------------------------
+def _ts() -> str:
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+def stg_tbl(table: str) -> str:
+    return f"{STAGING_SCHEMA}.stg_{table}"
+
+def hist_tbl(table: str) -> str:
+    return f"{HISTORY_SCHEMA}.{table}_HISTORY"
+
+def _table_exists(name: str) -> bool:
+    try:
+        spark.read.table(name).limit(1).count()
+        return True
+    except Exception:
+        return False
+
+def _ensure_schema(schema_name: str) -> None:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+
+def _resolve_insert_ts_col(df: DataFrame) -> str:
+    cols = {c.lower(): c for c in df.columns}
+    for c in ("insert_timestamp", "insert_ts"):
+        if c in cols:
+            return cols[c]
+    raise ValueError("Insert timestamp column not found. Expected: insert_timestamp or insert_ts")
+
+# ============================================================
+# 1) STAGING: Partition by STG_LOAD_DATE (CST)
+# ============================================================
+def _ensure_stg_load_date(df: DataFrame) -> DataFrame:
+    if "STG_LOAD_DATE" in df.columns:
+        return df
+    ts_col = _resolve_insert_ts_col(df)
+    return df.withColumn("STG_LOAD_DATE", F.to_date(F.from_utc_timestamp(F.col(ts_col), "America/Chicago")))
+
+def _project_for_write(df: DataFrame, col_order: Optional[List[str]] = None) -> DataFrame:
+    with_date = _ensure_stg_load_date(df)
+    cols = col_order if col_order else [c for c in with_date.columns if c != "STG_LOAD_DATE"] + ["STG_LOAD_DATE"]
+    for c in cols:
+        if c not in with_date.columns:
+            with_date = with_date.withColumn(c, F.lit(None))
+    return with_date.select(*cols)
+
+def migrate_staging_to_partition(table_name: str) -> None:
+    src = stg_tbl(table_name)
+    tmp = f"{src}_TMP_PART"
+    bak = f"{src}_BAK_{int(datetime.now().timestamp())}"
+
+    print(f"[{_ts()}] Migrating {src} to partition by STG_LOAD_DATE ...")
+    if not _table_exists(src):
+        print(f"[{_ts()}] Source {src} does not exist; skipping.")
+        return
+
+    df = spark.read.table(src)
+    desc = spark.sql(f"DESCRIBE DETAIL {src}").collect()[0]
+    part_cols = [c.upper() if isinstance(c, str) else c for c in (desc.get("partitionColumns") or [])]
+    if "STG_LOAD_DATE" in part_cols:
+        print(f"[{_ts()}] {src} already partitioned by STG_LOAD_DATE; skipping.")
+        return
+
+    dfw = _project_for_write(df)
+
+    print(f"[{_ts()}] Writing temp partitioned table {tmp} ...")
+    (dfw.write.mode("overwrite").partitionBy("STG_LOAD_DATE").saveAsTable(tmp))
+
+    print(f"[{_ts()}] Swapping tables: {src} -> {bak}, {tmp} -> {src}")
+    spark.sql(f"ALTER TABLE {src} RENAME TO {bak}")
+    spark.sql(f"ALTER TABLE {tmp} RENAME TO {src}")
+    print(f"[{_ts()}] Migration complete for {src}. Backup retained as {bak}")
+
+def migrate_all_staging_tables():
+    print(f"[{_ts()}] Starting staging migration ...")
+    try:
+        tables = spark.read.table(TABLES_LIST).select("TABLE_NAME")
+    except AnalysisException:
+        print(f"[{_ts()}] {TABLES_LIST} not found; nothing to migrate.")
+        return
+    for r in tables.collect():
+        migrate_staging_to_partition(r["TABLE_NAME"])
+    print(f"[{_ts()}] Staging migration finished.")
+
+def write_daily_staging(table_name: str, incoming_df: DataFrame) -> None:
+    target = stg_tbl(table_name)
+    dfw = _project_for_write(incoming_df)
+    if _table_exists(target):
+        print(f"[{_ts()}] Appending to {target} (partitioned by STG_LOAD_DATE)")
+        (dfw.write.mode("append").partitionBy("STG_LOAD_DATE").saveAsTable(target))
+    else:
+        print(f"[{_ts()}] Creating {target} (partitioned by STG_LOAD_DATE)")
+        (dfw.write.mode("overwrite").partitionBy("STG_LOAD_DATE").saveAsTable(target))
+    print(f"[{_ts()}] Write complete for {target}")
+
+# ============================================================
+# 2) Shared date helpers for planners (FAST + fallback)
+# ============================================================
+def staging_dates_df(stg_df: DataFrame) -> DataFrame:
+    if "STG_LOAD_DATE" in stg_df.columns:
+        return (stg_df.select("STG_LOAD_DATE")
+                      .dropDuplicates(["STG_LOAD_DATE"])
+                      .withColumnRenamed("STG_LOAD_DATE", "load_date")
+                      .orderBy("load_date"))
+    ts_col = _resolve_insert_ts_col(stg_df)
+    return (stg_df
+            .select(F.to_date(F.from_utc_timestamp(F.col(ts_col), "America/Chicago")).alias("load_date"))
+            .dropDuplicates(["load_date"])
+            .orderBy("load_date"))
+
+def staging_filter_by_date(stg_df: DataFrame, d):
+    if "STG_LOAD_DATE" in stg_df.columns:
+        return stg_df.where(F.col("STG_LOAD_DATE") == F.lit(str(d)).cast("date"))
+    ts_col = _resolve_insert_ts_col(stg_df)
+    return stg_df.where(F.to_date(F.from_utc_timestamp(F.col(ts_col), "America/Chicago")) == F.lit(str(d)).cast("date"))
+
+# ============================================================
+# 3) HISTORY APPLY – A/I logs only, partitioned logs, streaming dates
+# ============================================================
+hist_log_schema = T.StructType([
+    T.StructField("load_date", T.DateType()),
+    T.StructField("table_name", T.StringType()),
+    T.StructField("status", T.StringType()),      # 'A' (active writes from I/U), 'I' (inactivations from D)
+    T.StructField("count", T.LongType()),
+    T.StructField("error_message", T.StringType()),  # kept for convenience; will be NULL in A/I paths
+    T.StructField("insert_timestamp", T.TimestampType()),
+    T.StructField("start_time", T.TimestampType()),
+    T.StructField("end_time", T.TimestampType()),
+    T.StructField("load_type", T.StringType()),   # "history"
+])
+
+def _create_empty_partitioned_table(table_fqn: str, schema_struct: T.StructType,
+                                    partition_cols: List[str]) -> None:
+    _ensure_schema(table_fqn.split('.')[0])
+    print(f"[{_ts()}] Creating empty partitioned table {table_fqn} PARTITIONED BY {partition_cols}")
+    (spark.createDataFrame([], schema_struct)
+          .write.mode("overwrite")
+          .partitionBy(*partition_cols)
+          .saveAsTable(table_fqn))
+
+def ensure_history_log_tables_exist() -> None:
+    print(f"[{_ts()}] Ensuring history log tables exist (partitioned) ...")
+    _ensure_schema("LOGS")
+    if not _table_exists("LOGS.history_daily_log"):
+        _create_empty_partitioned_table("LOGS.history_daily_log", hist_log_schema, ["table_name", "load_date"])
+    if not _table_exists("LOGS.history_final_log"):
+        _create_empty_partitioned_table("LOGS.history_final_log", hist_log_schema, ["table_name", "load_date"])
+
+def reset_history_daily_log() -> None:
+    ensure_history_log_tables_exist()
+    print(f"[{_ts()}] Truncating LOGS.history_daily_log ...")
+    spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
+
+def append_history_daily_log(table_name: str, load_date: date, status: str,
+                             cnt: int, start_time: datetime,
+                             error_message: str | None = None) -> None:
+    end_time = datetime.now(tz)
+    row_df = spark.createDataFrame(
+        [(load_date, table_name, status, int(cnt or 0), error_message,
+          end_time, start_time, end_time, "history")],
+        schema=hist_log_schema
+    )
+    print(f"[{_ts()}] LOG -> table={table_name}, date={load_date}, status={status}, count={cnt}")
+    (row_df
+     .select("load_date", "table_name", "status", "count", "error_message",
+             "insert_timestamp", "start_time", "end_time", "load_type")
+     .write.mode("append").saveAsTable("LOGS.history_daily_log"))
+
+def consolidate_history_logs_to_final(dedupe: bool = True) -> None:
+    print(f"[{_ts()}] Consolidating history daily logs -> final (dedupe={dedupe}) ...")
+    try:
+        daily = spark.read.table("LOGS.history_daily_log")
+    except Exception:
+        print(f"[{_ts()}] No LOGS.history_daily_log; nothing to consolidate.")
+        return
+
+    if daily.rdd.isEmpty():
+        print(f"[{_ts()}] history_daily_log empty; truncating.")
+        spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
+        return
+
+    try:
+        final_ = spark.read.table("LOGS.history_final_log")
+    except Exception:
+        final_ = spark.createDataFrame([], hist_log_schema)
+
+    if not dedupe:
+        (daily.select("load_date","table_name","status","count","error_message",
+                      "insert_timestamp","start_time","end_time","load_type")
+              .write.mode("append").saveAsTable("LOGS.history_final_log"))
+        spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
+        return
+
+    union_df = final_.unionByName(daily)
+    w = Window.partitionBy("load_date", "table_name", "status").orderBy(F.col("end_time").desc_nulls_last())
+    dedup = union_df.withColumn("_rn", F.row_number().over(w)).where(F.col("_rn") == 1).drop("_rn")
+
+    (dedup.select("load_date","table_name","status","count","error_message",
+                  "insert_timestamp","start_time","end_time","load_type")
+          .write.mode("overwrite")
+          .partitionBy("table_name", "load_date")
+          .saveAsTable("LOGS.history_final_log"))
+
+    spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
+    print(f"[{_ts()}] Consolidation complete.")
+
+def _history_status_by_date(table_name: str) -> DataFrame:
+    """
+    A date is 'successful' if there is at least one 'A' or 'I' row in FINAL logs.
+    No error notion; failures simply leave no log rows and are treated as unprocessed.
+    """
+    try:
+        fl = spark.read.table("LOGS.history_final_log").filter(F.col("table_name") == table_name)
+    except Exception:
+        return spark.createDataFrame([], T.StructType([
+            T.StructField("load_date", T.DateType()),
+            T.StructField("has_ok", T.IntegerType()),
+        ]))
+    agg = (fl.groupBy("load_date")
+             .agg(F.sum(F.when(F.col("status").isin("A", "I"), 1).otherwise(0)).alias("ok_rows"))
+             .select(F.col("load_date"), (F.col("ok_rows") > 0).cast("int").alias("has_ok")))
+    return agg
+
+def _iter_dates(df: DataFrame) -> Iterable[date]:
+    for r in df.toLocalIterator():
+        yield r["load_date"]
+
+def classify_history_dates_for_table(table_name: str, stg_df: DataFrame) -> Dict[str, List[date]]:
+    sdates = staging_dates_df(stg_df).alias("s")
+    status = _history_status_by_date(table_name).alias("f")
+    joined = (sdates.join(status, on="load_date", how="left")
+                    .select(F.col("load_date"), F.coalesce(F.col("has_ok"), F.lit(0)).alias("has_ok"))
+                    .orderBy("load_date"))
+
+    success = joined.where(F.col("has_ok") == 1).select("load_date")
+    unproc  = joined.where(F.col("has_ok") == 0).select("load_date")
+
+    success_dates = list(_iter_dates(success))
+    unprocessed_dates, c = [], 0
+    for d in _iter_dates(unproc):
+        unprocessed_dates.append(d)
+        c += 1
+        if c >= MAX_DATES_PER_TABLE:
+            break
+
+    return {"failed_dates": [], "success_dates": success_dates, "unprocessed_dates": unprocessed_dates}
+
+# ------------------------
+# History table mgmt & per-date apply
+# ------------------------
+def ensure_history_table(table_name: str, stg_like: DataFrame) -> DataFrame:
+    hname = hist_tbl(table_name)
+    try:
+        hdf = spark.read.table(hname)
+        if "FLAG" not in [c.upper() for c in hdf.columns]:
+            print(f"[{_ts()}] {hname} missing FLAG; creating empty with FLAG.")
+            empty = stg_like.limit(0).withColumn("FLAG", F.lit(None).cast("string"))
+            empty.write.mode("overwrite").saveAsTable(hname)
+            hdf = spark.read.table(hname)
+        return hdf
+    except AnalysisException:
+        print(f"[{_ts()}] Creating new history table: {hname}")
+        empty = stg_like.limit(0).withColumn("FLAG", F.lit(None).cast("string"))
+        empty.write.mode("overwrite").saveAsTable(hname)
+        return spark.read.table(hname)
+
+def latest_active_history_rows_for_keys(hdf: DataFrame, key_cols: List[str], keys_df: DataFrame) -> DataFrame:
+    order_candidates = [c for c in hdf.columns if c.lower() in ("insert_timestamp", "insert_ts")]
+    if order_candidates:
+        order_col = order_candidates[0]
+        w = Window.partitionBy(*key_cols).orderBy(F.col(order_col).desc_nulls_last())
+    else:
+        w = Window.partitionBy(*key_cols).orderBy(F.monotonically_increasing_id().desc())
+
+    join_cond = [F.col(f"h.{k}") == F.col(f"k.{k}") for k in key_cols]
+    active = (hdf.alias("h")
+                .filter(F.upper(F.col("h.FLAG")) == "A")
+                .join(keys_df.alias("k"), on=join_cond, how="inner"))
+    ranked = active.withColumn("_rn", F.row_number().over(w))
+    return ranked.where(F.col("_rn") == 1).drop("_rn")
+
+def _add_flag_column(df: DataFrame, flag_value: str, target_cols: List[str]) -> DataFrame:
+    work = df
+    if "FLAG" not in work.columns:
+        work = work.withColumn("FLAG", F.lit(flag_value))
+    else:
+        work = work.withColumn("FLAG", F.lit(flag_value))
+    for c in target_cols:
+        if c not in work.columns:
+            work = work.withColumn(c, F.lit(None))
+    return work.select(*target_cols)
+
+def apply_history_for_table_and_date(table_name: str, key_cols: List[str], d: date) -> None:
+    start_table_date = datetime.now(tz)
+    print(f"[{_ts()}] === APPLY HISTORY: {table_name} @ {d} ===")
+    try:
+        stg_df = spark.read.table(stg_tbl(table_name))
+        stg_day = staging_filter_by_date(stg_df, d)
+
+        if stg_day.rdd.isEmpty():
+            print(f"[{_ts()}] No rows on {d} for {stg_tbl(table_name)}.")
+            t0 = datetime.now(tz)
+            append_history_daily_log(table_name, d, "A", 0, t0, None)
+            append_history_daily_log(table_name, d, "I", 0, t0, None)
+            return
+
+        status_col = next((c for c in stg_df.columns if c.lower() == "status"), None)
+        if not status_col:
+            raise ValueError("STATUS column not found in staging.")
+        hname = hist_tbl(table_name)
+        hist_df = ensure_history_table(table_name, stg_df)
+        target_cols = hist_df.columns
+        if "FLAG" not in [c.upper() for c in target_cols]:
+            target_cols = target_cols + ["FLAG"]
+
+        # Inactivate from deletes
+        start_inact = datetime.now(tz)
+        d_keys = (stg_day.filter(F.upper(F.col(status_col)) == "D")
+                         .select(*key_cols).dropDuplicates())
+        if d_keys.rdd.isEmpty():
+            inactivate_count = 0
+            inactivate_out = None
+        else:
+            latest_active = latest_active_history_rows_for_keys(hist_df, key_cols, d_keys)
+            if latest_active.rdd.isEmpty():
+                inactivate_count = 0
+                inactivate_out = None
+            else:
+                inactivate_out = _add_flag_column(latest_active, "I", target_cols)
+                inactivate_count = inactivate_out.count()
+                print(f"[{_ts()}] {table_name} {d} -> Inactivate (from D) count: {inactivate_count}")
+        append_history_daily_log(table_name, d, "I", inactivate_count or 0, start_inact, None)
+
+        # Active from inserts/updates
+        start_active = datetime.now(tz)
+        a_src = stg_day.filter(F.upper(F.col(status_col)).isin("I", "U"))
+        if a_src.rdd.isEmpty():
+            active_count = 0
+            active_out = None
+        else:
+            active_out = _add_flag_column(a_src, "A", target_cols)
+            active_count = active_out.count()
+            print(f"[{_ts()}] {table_name} {d} -> Active (from I/U) count: {active_count}")
+        append_history_daily_log(table_name, d, "A", active_count or 0, start_active, None)
+
+        if (inactivate_count or 0) == 0 and (active_count or 0) == 0:
+            print(f"[{_ts()}] {table_name} {d} -> No history writes required; skipping append.")
+            return
+
+        print(f"[{_ts()}] {table_name} {d} -> Appending to {hname}")
+        if inactivate_out is not None:
+            inactivate_out.write.mode("append").saveAsTable(hname)
+        if active_out is not None:
+            active_out.write.mode("append").saveAsTable(hname)
+
+        print(f"[{_ts()}] COMPLETE HISTORY {table_name} @ {d}  A={active_count}, I={inactivate_count}")
+
+    except Exception as e:
+        # No 'E' rows in logs; failures simply mean the date remains unprocessed
+        msg = f"{type(e).__name__}: {str(e)}"
+        traceback.print_exc()
+        print(f"[{_ts()}] FAILED HISTORY {table_name} @ {d}\n{msg}")
+        raise
+
+# ------------------------
+# Orchestration (only unprocessed; skip successes)
+# ------------------------
+def _apply_history_with_retry_for_date(table_name: str, key_cols: List[str], d: date) -> None:
+    attempts = 0
+    while True:
+        try:
+            print(f"[{_ts()}] Start HISTORY {table_name} {d} (attempt {attempts + 1})")
+            apply_history_for_table_and_date(table_name, key_cols, d)
+            return
+        except Exception:
+            attempts += 1
+            if attempts > MAX_RETRIES:
+                print(f"[{_ts()}] FINAL FAILURE HISTORY {table_name} {d}")
+                return
+            print(f"[{_ts()}] RETRY HISTORY in {SLEEP_BETWEEN_RETRIES}s for {table_name} {d}")
+            time.sleep(SLEEP_BETWEEN_RETRIES)
+
+def process_all_history() -> None:
+    print(f"[{_ts()}] Starting history apply (A/I only, backfill-aware) ...")
+    ensure_history_log_tables_exist()
+    reset_history_daily_log()
+
+    tables_df = spark.read.table(TABLES_LIST).select("TABLE_NAME", "KEY_COLUMN")
+    rows = [r.asDict() for r in tables_df.collect()]
+    print(f"[{_ts()}] Tables to scan for history: {len(rows)}")
+
+    plan: Dict[str, Dict] = {}
+    any_unprocessed = False
+
+    for r in rows:
+        table = r["TABLE_NAME"]
+        key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
+        print(f"[{_ts()}] Planning HISTORY -> table={table}, keys={key_cols}")
+        try:
+            stg = spark.read.table(stg_tbl(table))
+        except AnalysisException:
+            print(f"[{_ts()}] Staging missing for HISTORY: {stg_tbl(table)}; skipping")
+            continue
+
+        buckets = classify_history_dates_for_table(table, stg)
+        plan[table] = {"keys": key_cols, **buckets}
+
+        if buckets["unprocessed_dates"]:
+            any_unprocessed = True
+
+        print(f"[{_ts()}] Plan {table}: success={buckets['success_dates']}  unprocessed={buckets['unprocessed_dates']}")
+
+    if not any_unprocessed:
+        print(f"[{_ts()}] All tables/dates already processed successfully. Nothing to do.")
+        consolidate_history_logs_to_final(dedupe=True)
+        return
+
+    print(f"[{_ts()}] Execution mode: unprocessed_only")
+
+    def work_for_table(table: str, key_cols: List[str], dates: List[date]):
+        if not dates:
+            print(f"[{_ts()}] No unprocessed dates for {table}.")
+            return
+        print(f"[{_ts()}] HISTORY processing -> {table}: {', '.join(map(str, dates))}")
+        for d in dates:
+            _apply_history_with_retry_for_date(table, key_cols, d)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = []
+        for table, info in plan.items():
+            futures.append(ex.submit(work_for_table, table, info["keys"], info["unprocessed_dates"]))
+        for f in as_completed(futures):
+            f.result()
+
+    consolidate_history_logs_to_final(dedupe=True)
+    print(f"[{_ts()}] All history processing complete.")
+
+# ------------------------
+# Entrypoints (call what you need)
+# ------------------------
+# 1) Optional one-time migration for all listed staging tables:
+# migrate_all_staging_tables()
+
+# 2) Run the HISTORY apply job:
+# process_all_history()
