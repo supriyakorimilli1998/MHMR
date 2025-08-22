@@ -1,4 +1,8 @@
-# HISTORY  — Logs use I/U/D; empty days logged as 'N' (no-op); success = op_count>0 and no later error
+# HISTORY — CST everywhere; logic per your rules
+# I in staging  -> append to HISTORY with FLAG='A'
+# U in staging  -> append to HISTORY with FLAG='A'
+# D in staging  -> lookup active rows for keys; append those rows with FLAG='I' (inactivate). Do NOT append D staging rows.
+# Success = sum(I/U/D counts) > 0 AND no later error; empty day logs 'N' only
 
 from __future__ import annotations
 from datetime import datetime, date
@@ -16,7 +20,10 @@ from pyspark.sql.utils import AnalysisException
 # Spark session & configs
 # ------------------------
 spark = SparkSession.builder.appName("Apply History Tables - Backfill Aware (Final)").getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+# Store & display timestamps in CST/CDT
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
@@ -32,6 +39,9 @@ CATALOG = "MHMR_LAKEHOUSE"
 HISTORY_SCHEMA = f"{CATALOG}.HISTORY"
 STAGING_SCHEMA = "staging"
 TABLES_LIST = "TABLES_LIST"  # columns: TABLE_NAME, KEY_COLUMN (comma-separated keys)
+
+# Set this based on how staging stores its timestamps
+STAGING_TIMESTAMPS_ARE_UTC = True
 
 MAX_WORKERS = 4
 MAX_RETRIES = 2
@@ -49,10 +59,6 @@ def stg_tbl(table: str) -> str:
 def hist_tbl(table: str) -> str:
     return f"{HISTORY_SCHEMA}.{table}_HISTORY"
 
-def _local_date_from_ts(col_name: str):
-    """Convert a UTC timestamp column to America/Chicago date."""
-    return F.to_date(F.from_utc_timestamp(F.col(col_name), "America/Chicago"))
-
 def _resolve_insert_ts_col(df: DataFrame) -> str:
     cols = {c.lower(): c for c in df.columns}
     for c in ("insert_timestamp", "insert_ts"):
@@ -66,28 +72,40 @@ def _resolve_status_col(df: DataFrame) -> str:
             return c
     raise ValueError("STATUS column not found.")
 
+def _to_cst_date_from_ts(col_name: str):
+    """Return CST/CDT date from a timestamp column, respecting STAGING_TIMESTAMPS_ARE_UTC."""
+    if STAGING_TIMESTAMPS_ARE_UTC:
+        return F.to_date(F.from_utc_timestamp(F.col(col_name), "America/Chicago"))
+    else:
+        return F.to_date(F.col(col_name))
+
 def _staging_on_date(df: DataFrame, d: date) -> DataFrame:
-    """Filter staging rows to the given local date derived from insert_ts."""
     ts = _resolve_insert_ts_col(df)
-    return df.where(_local_date_from_ts(ts) == F.lit(str(d)).cast("date"))
+    return df.where(_to_cst_date_from_ts(ts) == F.lit(str(d)).cast("date"))
+
+def _localize_staging_ts(df: DataFrame) -> DataFrame:
+    """Make sure the staging timestamp column is CST when we write it to HISTORY."""
+    ts_col = _resolve_insert_ts_col(df)
+    if STAGING_TIMESTAMPS_ARE_UTC:
+        return df.withColumn(ts_col, F.from_utc_timestamp(F.col(ts_col), "America/Chicago"))
+    else:
+        return df
 
 def _add_flag_column(df: DataFrame, flag_value: str, target_cols: List[str]) -> DataFrame:
     """Ensure FLAG exists and project to target cols in order."""
-    work = df
-    work = work.withColumn("FLAG", F.lit(flag_value))
+    work = df.withColumn("FLAG", F.lit(flag_value))
     for c in target_cols:
         if c not in work.columns:
             work = work.withColumn(c, F.lit(None))
     return work.select(*target_cols)
 
 # ------------------------
-# Generic ensure schema/table helpers
+# Ensure schema/table helpers
 # ------------------------
 def _ensure_schema(schema_name: str) -> None:
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
 
 def _ensure_table(table_fqn: str, schema_struct: T.StructType) -> None:
-    """If table doesn't exist, create it empty with the provided schema."""
     _ensure_schema(table_fqn.split('.')[0])
     try:
         spark.read.table(table_fqn).limit(1).count()
@@ -95,18 +113,18 @@ def _ensure_table(table_fqn: str, schema_struct: T.StructType) -> None:
         spark.createDataFrame([], schema_struct).write.mode("overwrite").saveAsTable(table_fqn)
 
 # ------------------------
-# Logging (daily reset; final holds history) — STATUSES: I/U/D/E/N
+# Logging (CST) — STATUSES: I/U/D/E/N
 # ------------------------
 hist_log_schema = T.StructType([
     T.StructField("load_date", T.DateType()),
     T.StructField("table_name", T.StringType()),
-    T.StructField("status", T.StringType()),      # 'I' (insert), 'U' (update), 'D' (inactivation), 'E' (error), 'N' (no-op)
+    T.StructField("status", T.StringType()),      # 'I','U','D' (from staging/inactivation), 'E' (error), 'N' (no-op)
     T.StructField("count", T.LongType()),
     T.StructField("error_message", T.StringType()),
-    T.StructField("insert_timestamp", T.TimestampType()),
-    T.StructField("start_time", T.TimestampType()),
-    T.StructField("end_time", T.TimestampType()),
-    T.StructField("load_type", T.StringType()),   # "history"
+    T.StructField("insert_timestamp", T.TimestampType()),  # CST/CDT
+    T.StructField("start_time", T.TimestampType()),        # CST/CDT
+    T.StructField("end_time", T.TimestampType()),          # CST/CDT
+    T.StructField("load_type", T.StringType()),            # "history"
 ])
 
 def ensure_history_log_tables_exist() -> None:
@@ -120,15 +138,24 @@ def reset_history_daily_log() -> None:
     print(f"[{_ts()}] Truncating LOGS.history_daily_log ...")
     spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
 
+def _now_ts():
+    return F.current_timestamp()  # With session TZ set to CST/CDT
+
 def append_history_daily_log(table_name: str, load_date: date, status: str,
-                             cnt: int, start_time: datetime,
+                             cnt: int, start_time_py: datetime | None = None,
                              error_message: str | None = None) -> None:
-    end_time = datetime.now(tz)
-    row_df = spark.createDataFrame(
-        [(load_date, table_name, status, int(cnt or 0), error_message,
-          end_time, start_time, end_time, "history")],
-        schema=hist_log_schema
-    )
+    start_ts = F.lit(start_time_py).cast("timestamp") if start_time_py else _now_ts()
+    row_df = (spark.range(1).select(
+        F.lit(load_date).cast("date").alias("load_date"),
+        F.lit(table_name).alias("table_name"),
+        F.lit(status).alias("status"),
+        F.lit(int(cnt or 0)).cast("long").alias("count"),
+        F.lit(error_message).cast("string").alias("error_message"),
+        _now_ts().alias("insert_timestamp"),
+        start_ts.alias("start_time"),
+        _now_ts().alias("end_time"),
+        F.lit("history").alias("load_type"),
+    ))
     print(f"[{_ts()}] LOGS.history_daily_log += table={table_name}, date={load_date}, status={status}, count={cnt}")
     row_df.write.mode("append").saveAsTable("LOGS.history_daily_log")
 
@@ -167,13 +194,12 @@ def consolidate_history_logs_to_final(dedupe: bool = True) -> None:
 # ------------------------
 def _final_status_rollup(table_name: str) -> DataFrame:
     """
-    Returns per-date rollup with:
-      op_count      : SUM(count) over I/U/D
-      max_op_end    : MAX(end_time) where status in I/U/D
-      max_err_end   : MAX(end_time) where status = 'E'
-      has_ok        : 1 if op_count>0 and (max_err_end IS NULL or max_err_end < max_op_end)
-      has_err       : 1 if max_err_end IS NOT NULL and (max_op_end IS NULL or max_err_end >= max_op_end)
-    'N' rows are ignored for success and error.
+    Per date:
+      op_count    : SUM(count) over I/U/D
+      max_op_end  : latest end_time over I/U/D
+      max_err_end : latest end_time over E
+      has_ok      : op_count>0 AND (no error after latest op)
+      has_err     : error present AND (no op after that error)
     """
     try:
         fl = spark.read.table("LOGS.history_final_log").filter(F.col("table_name") == table_name)
@@ -190,78 +216,50 @@ def _final_status_rollup(table_name: str) -> DataFrame:
 
     op = (fl.filter(F.col("status").isin("I", "U", "D"))
             .groupBy("load_date")
-            .agg(
-                F.sum("count").alias("op_count"),
-                F.max("end_time").alias("max_op_end")
-            ))
-
+            .agg(F.sum("count").alias("op_count"),
+                 F.max("end_time").alias("max_op_end")))
     err = (fl.filter(F.col("status") == "E")
-             .groupBy("load_date")
-             .agg(F.max("end_time").alias("max_err_end")))
+            .groupBy("load_date")
+            .agg(F.max("end_time").alias("max_err_end")))
 
     joined = (op.join(err, on="load_date", how="outer")
-                .select(
-                    F.col("load_date"),
-                    F.coalesce(F.col("op_count"), F.lit(0)).alias("op_count"),
-                    F.col("max_op_end"),
-                    F.col("max_err_end")
-                ))
-
-    has_ok = ( (F.col("op_count") > 0) & (F.col("max_err_end").isNull() | (F.col("max_err_end") < F.col("max_op_end"))) ).cast("int")
-    has_err = ( F.col("max_err_end").isNotNull() & (F.col("max_op_end").isNull() | (F.col("max_err_end") >= F.col("max_op_end"))) ).cast("int")
-
-    return joined.select("load_date", "op_count", "max_op_end", "max_err_end", has_ok.alias("has_ok"), has_err.alias("has_err"))
+                .select(F.col("load_date"),
+                        F.coalesce(F.col("op_count"), F.lit(0)).alias("op_count"),
+                        F.col("max_op_end"),
+                        F.col("max_err_end")))
+    has_ok = ((F.col("op_count") > 0) & (F.col("max_err_end").isNull() | (F.col("max_err_end") < F.col("max_op_end")))).cast("int")
+    has_err = (F.col("max_err_end").isNotNull() & (F.col("max_op_end").isNull() | (F.col("max_err_end") >= F.col("max_op_end")))).cast("int")
+    return joined.select("load_date", "op_count", "max_op_end", "max_err_end",
+                         has_ok.alias("has_ok"), has_err.alias("has_err"))
 
 def processed_success_dates_history(table_name: str) -> DataFrame:
-    """Dates where has_ok=1."""
-    roll = _final_status_rollup(table_name)
-    return roll.where(F.col("has_ok") == 1).select("load_date").distinct()
+    return _final_status_rollup(table_name).where(F.col("has_ok") == 1).select("load_date").distinct()
 
 # ------------------------
-# Date classification over staging vs FINAL logs (failures-first)
+# Date classification (failures-first)
 # ------------------------
 def _staging_local_dates(stg_df: DataFrame) -> DataFrame:
     ts = _resolve_insert_ts_col(stg_df)
-    return stg_df.select(_local_date_from_ts(ts).alias("load_date")).distinct()
+    return stg_df.select(_to_cst_date_from_ts(ts).alias("load_date")).distinct()
 
 def _history_status_by_date(table_name: str) -> DataFrame:
-    """Per-date flags computed from FINAL logs rollup."""
     roll = _final_status_rollup(table_name)
-    return roll.select(
-        "load_date",
-        F.col("has_ok").cast("int").alias("has_ok"),
-        F.col("has_err").cast("int").alias("has_err")
-    )
+    return roll.select("load_date",
+                       F.col("has_ok").cast("int").alias("has_ok"),
+                       F.col("has_err").cast("int").alias("has_err"))
 
 def classify_history_dates_for_table(table_name: str, stg_df: DataFrame) -> Dict[str, list]:
-    """
-    For this table, look at all dates present in staging and classify using FINAL logs:
-      failed_dates: has_err=1
-      success_dates: has_ok=1 (skip)
-      unprocessed_dates: neither ok nor err (process)
-    """
     sdates = _staging_local_dates(stg_df).alias("s")
     status = _history_status_by_date(table_name).alias("f")
     joined = (sdates.join(status, on="load_date", how="left")
-                    .select(
-                        F.col("load_date"),
-                        F.coalesce(F.col("has_ok"), F.lit(0)).alias("has_ok"),
-                        F.coalesce(F.col("has_err"), F.lit(0)).alias("has_err")
-                    ))
-
-    failed = (joined.where(F.col("has_err") == 1).orderBy("load_date")
-                   .select("load_date").collect())
-    success = (joined.where((F.col("has_ok") == 1) & (F.col("has_err") == 0)).orderBy("load_date")
-                    .select("load_date").collect())
-    unproc = (joined.where((F.col("has_ok") == 0) & (F.col("has_err") == 0)).orderBy("load_date")
-                   .select("load_date").collect())
-
+                    .select(F.col("load_date"),
+                            F.coalesce(F.col("has_ok"), F.lit(0)).alias("has_ok"),
+                            F.coalesce(F.col("has_err"), F.lit(0)).alias("has_err")))
+    failed = (joined.where(F.col("has_err") == 1).orderBy("load_date").select("load_date").collect())
+    success = (joined.where((F.col("has_ok") == 1) & (F.col("has_err") == 0)).orderBy("load_date").select("load_date").collect())
+    unproc = (joined.where((F.col("has_ok") == 0) & (F.col("has_err") == 0)).orderBy("load_date").select("load_date").collect())
     to_py = lambda rows: [r["load_date"] for r in rows]
-    return {
-        "failed_dates": to_py(failed),
-        "success_dates": to_py(success),
-        "unprocessed_dates": to_py(unproc),
-    }
+    return {"failed_dates": to_py(failed), "success_dates": to_py(success), "unprocessed_dates": to_py(unproc)}
 
 # ------------------------
 # History table management & key lookups
@@ -285,19 +283,16 @@ def ensure_history_table(table_name: str, stg_like: DataFrame) -> DataFrame:
 
 def latest_active_history_rows_for_keys(hdf: DataFrame, key_cols: List[str], keys_df: DataFrame) -> DataFrame:
     """
-    From history, pick the latest active ('A') record(s) per key that match keys_df.
-    Project to h.* to avoid duplicate key columns.
+    Get the latest active ('A') row per key.
+    Join on qualified cols; then project h.* to avoid duplicate key columns (prevents ambiguous refs).
     """
     order_candidates = [c for c in hdf.columns if c.lower() in ("insert_timestamp", "insert_ts")]
     order_col = order_candidates[0] if order_candidates else None
-
     join_cond = [F.col(f"h.{k}") == F.col(f"k.{k}") for k in key_cols]
 
-    joined = (
-        hdf.alias("h")
-           .filter(F.upper(F.col("h.FLAG")) == "A")
-           .join(keys_df.alias("k"), on=join_cond, how="inner")
-    )
+    joined = (hdf.alias("h")
+                .filter(F.upper(F.col("h.FLAG")) == "A")
+                .join(keys_df.alias("k"), on=join_cond, how="inner"))
 
     proj = joined.select(*[F.col(f"h.{c}").alias(c) for c in hdf.columns])
 
@@ -306,19 +301,18 @@ def latest_active_history_rows_for_keys(hdf: DataFrame, key_cols: List[str], key
     else:
         w = Window.partitionBy(*[F.col(k) for k in key_cols]).orderBy(F.monotonically_increasing_id().desc())
 
-    ranked = proj.withColumn("_rn", F.row_number().over(w))
-    pick = ranked.where(F.col("_rn") == 1).drop("_rn")
-    return pick
+    return proj.withColumn("_rn", F.row_number().over(w)).where(F.col("_rn") == 1).drop("_rn")
 
 # ------------------------
-# History apply per (table, date) — LOG I/U/D/N/E, write FLAG A/I
+# History apply — per (table, date)
 # ------------------------
 def apply_history_for_table_and_date(table_name: str, key_cols: List[str], d: date) -> None:
     """
-    - STATUS='D' in staging: clone latest active ('A') history rows for those keys and append with FLAG='I'; log 'D'
-    - STATUS='I' in staging: append those rows with FLAG='A'; log 'I'
-    - STATUS='U' in staging: append those rows with FLAG='A'; log 'U'
-    - Empty day: log 'N' only (no-op)
+    Your rules:
+      I: append staging rows with FLAG='A'
+      U: append staging rows with FLAG='A'
+      D: append inactive clone(s) of matching active history rows (FLAG='I'); do NOT append staging D rows
+      Empty day: log 'N' only
     """
     start_table_date = datetime.now(tz)
     print(f"[{_ts()}] === APPLY HISTORY: {table_name} @ {d} ===")
@@ -329,8 +323,7 @@ def apply_history_for_table_and_date(table_name: str, key_cols: List[str], d: da
 
         if stg_day.rdd.isEmpty():
             print(f"[{_ts()}] No rows on {d} for {stg_tbl(table_name)}.")
-            t0 = datetime.now(tz)
-            append_history_daily_log(table_name, d, "N", 0, t0, None)  # neutral; does not count as success
+            append_history_daily_log(table_name, d, "N", 0, start_table_date, None)
             return
 
         hname = hist_tbl(table_name)
@@ -339,58 +332,53 @@ def apply_history_for_table_and_date(table_name: str, key_cols: List[str], d: da
         if "FLAG" not in target_cols:
             target_cols = target_cols + ["FLAG"]
 
-        # D (inactivate)
+        # Partition staging by op and localize timestamps to CST
+        d_src = _localize_staging_ts(stg_day.filter(F.upper(F.col(status_col)) == "D"))
+        i_src = _localize_staging_ts(stg_day.filter(F.upper(F.col(status_col)) == "I"))
+        u_src = _localize_staging_ts(stg_day.filter(F.upper(F.col(status_col)) == "U"))
+
+        # --------- D (inactivate actives by keys) ----------
         start_d = datetime.now(tz)
-        d_keys = (stg_day.filter(F.upper(F.col(status_col)) == "D")
-                         .select(*key_cols).dropDuplicates())
-        if d_keys.rdd.isEmpty():
-            d_count = 0
-            d_out = None
-        else:
-            latest_active = latest_active_history_rows_for_keys(hist_df, key_cols, d_keys)
-            if latest_active.rdd.isEmpty():
-                d_count = 0
-                d_out = None
-            else:
-                d_out = _add_flag_column(latest_active, "I", target_cols)
-                d_count = d_out.count()
-                print(f"[{_ts()}] {table_name} {d} -> D (inactivate) count: {d_count}")
-        append_history_daily_log(table_name, d, "D", d_count or 0, start_d, None)
+        d_inact_out = None
+        d_count_inactivated = 0
+        if not d_src.rdd.isEmpty():
+            d_keys = d_src.select(*key_cols).dropDuplicates()
+            if not d_keys.rdd.isEmpty():
+                latest_active_d = latest_active_history_rows_for_keys(hist_df, key_cols, d_keys)
+                if not latest_active_d.rdd.isEmpty():
+                    d_inact_out = _add_flag_column(latest_active_d, "I", target_cols)
+                    d_count_inactivated = d_inact_out.count()
+        append_history_daily_log(table_name, d, "D", d_count_inactivated, start_d, None)
 
-        # I (insert -> active)
+        # --------- I (append as active) ----------
         start_i = datetime.now(tz)
-        i_src = stg_day.filter(F.upper(F.col(status_col)) == "I")
-        if i_src.rdd.isEmpty():
-            i_count = 0
-            i_out = None
-        else:
+        i_out = None
+        i_count = 0
+        if not i_src.rdd.isEmpty():
             i_out = _add_flag_column(i_src, "A", target_cols)
-            i_count = i_out.count()
-            print(f"[{_ts()}] {table_name} {d} -> I (insert->active) count: {i_count}")
-        append_history_daily_log(table_name, d, "I", i_count or 0, start_i, None)
+            i_count = i_src.count()
+        append_history_daily_log(table_name, d, "I", i_count, start_i, None)
 
-        # U (update -> active)
+        # --------- U (append as active) ----------
         start_u = datetime.now(tz)
-        u_src = stg_day.filter(F.upper(F.col(status_col)) == "U")
-        if u_src.rdd.isEmpty():
-            u_count = 0
-            u_out = None
-        else:
+        u_out = None
+        u_count = 0
+        if not u_src.rdd.isEmpty():
             u_out = _add_flag_column(u_src, "A", target_cols)
-            u_count = u_out.count()
-            print(f"[{_ts()}] {table_name} {d} -> U (update->active) count: {u_count}")
-        append_history_daily_log(table_name, d, "U", u_count or 0, start_u, None)
+            u_count = u_src.count()
+        append_history_daily_log(table_name, d, "U", u_count, start_u, None)
 
-        if (d_count or 0) == 0 and (i_count or 0) == 0 and (u_count or 0) == 0:
+        # If nothing to write, stop here
+        if all(x is None for x in [d_inact_out, i_out, u_out]):
             print(f"[{_ts()}] {table_name} {d} -> No history writes; skipping append.")
             return
 
         print(f"[{_ts()}] {table_name} {d} -> Appending to {hname}")
-        if d_out is not None: d_out.write.mode("append").saveAsTable(hname)
-        if i_out is not None: i_out.write.mode("append").saveAsTable(hname)
-        if u_out is not None: u_out.write.mode("append").saveAsTable(hname)
+        for out in [d_inact_out, i_out, u_out]:
+            if out is not None:
+                out.write.mode("append").saveAsTable(hname)
 
-        print(f"[{_ts()}] COMPLETE HISTORY {table_name} @ {d}  D={d_count}, I={i_count}, U={u_count}")
+        print(f"[{_ts()}] COMPLETE HISTORY {table_name} @ {d}  D(inactivated)={d_count_inactivated}, I(stg)={i_count}, U(stg)={u_count}")
 
     except Exception as e:
         msg = f"{type(e).__name__}: {str(e)}"
@@ -430,7 +418,6 @@ def process_all_history() -> None:
     any_failed = False
     any_unprocessed = False
 
-    # Build plan: classify dates per table using staging presence vs FINAL logs
     for r in all_rows:
         table = r["TABLE_NAME"]
         key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
@@ -442,16 +429,10 @@ def process_all_history() -> None:
 
         buckets = classify_history_dates_for_table(table, stg)
         plan[table] = {"keys": key_cols, **buckets}
+        if buckets["failed_dates"]: any_failed = True
+        if buckets["unprocessed_dates"]: any_unprocessed = True
 
-        if buckets["failed_dates"]:
-            any_failed = True
-        if buckets["unprocessed_dates"]:
-            any_unprocessed = True
-
-        print(f"[{_ts()}] Plan {table}: "
-              f"failed={buckets['failed_dates']}, "
-              f"success={buckets['success_dates']}, "
-              f"unprocessed={buckets['unprocessed_dates']}")
+        print(f"[{_ts()}] Plan {table}: failed={buckets['failed_dates']}, success={buckets['success_dates']}, unprocessed={buckets['unprocessed_dates']}")
 
     if not any_failed and not any_unprocessed:
         print(f"[{_ts()}] All tables/dates already processed successfully. Nothing to do.")
@@ -467,7 +448,6 @@ def process_all_history() -> None:
         for d in dates:
             _apply_history_with_retry_for_date(table, key_cols, d)
 
-    # Parallelize across tables; keep per-table dates serial
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = []
         for table, info in plan.items():
