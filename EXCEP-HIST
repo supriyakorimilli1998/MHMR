@@ -1,4 +1,4 @@
-# HISTORY APPLY (Final, Backfill-Aware, Failures-First) — Logs use I/U/D
+# HISTORY  — Logs use I/U/D
 
 from __future__ import annotations
 from datetime import datetime, date
@@ -268,21 +268,34 @@ def ensure_history_table(table_name: str, stg_like: DataFrame) -> DataFrame:
 def latest_active_history_rows_for_keys(hdf: DataFrame, key_cols: List[str], keys_df: DataFrame) -> DataFrame:
     """
     From history, pick the latest active ('A') record(s) per key that match keys_df.
-    Ordering heuristic prefers INSERT_* timestamp if available.
+    We join on qualified columns, then project to h.* to avoid duplicate key columns
+    (which caused AMBIGUOUS_REFERENCE in window specs).
     """
+    # Prefer a timestamp-like column to define "latest"
     order_candidates = [c for c in hdf.columns if c.lower() in ("insert_timestamp", "insert_ts")]
-    if order_candidates:
-        order_col = order_candidates[0]
-        w = Window.partitionBy(*key_cols).orderBy(F.col(order_col).desc_nulls_last())
-    else:
-        w = Window.partitionBy(*key_cols).orderBy(F.monotonically_increasing_id().desc())
+    order_col = order_candidates[0] if order_candidates else None
 
+    # Build qualified join condition
     join_cond = [F.col(f"h.{k}") == F.col(f"k.{k}") for k in key_cols]
-    active = (hdf.alias("h")
-                .filter(F.upper(F.col("h.FLAG")) == "A")
-                .join(keys_df.alias("k"), on=join_cond, how="inner"))
 
-    ranked = active.withColumn("_rn", F.row_number().over(w))
+    # Filter to active rows and join to the requested keys
+    joined = (
+        hdf.alias("h")
+           .filter(F.upper(F.col("h.FLAG")) == "A")
+           .join(keys_df.alias("k"), on=join_cond, how="inner")
+    )
+
+    # Project ONLY the history side to drop duplicate key columns from k.*
+    proj = joined.select(*[F.col(f"h.{c}").alias(c) for c in hdf.columns])
+
+    # Define window over the (now unique) key columns
+    if order_col:
+        w = Window.partitionBy(*[F.col(k) for k in key_cols]).orderBy(F.col(order_col).desc_nulls_last())
+    else:
+        # Fallback ordering if no timestamp-ish column exists
+        w = Window.partitionBy(*[F.col(k) for k in key_cols]).orderBy(F.monotonically_increasing_id().desc())
+
+    ranked = proj.withColumn("_rn", F.row_number().over(w))
     pick = ranked.where(F.col("_rn") == 1).drop("_rn")
     return pick
 
