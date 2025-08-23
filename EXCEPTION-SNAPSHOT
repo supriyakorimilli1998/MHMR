@@ -1,4 +1,4 @@
-# SNAPSHOT (CST-aware writes for logs and snapshot tables)
+# SNAPSHOT (writes for logs and snapshot tables)
 
 from __future__ import annotations
 from datetime import datetime, date
