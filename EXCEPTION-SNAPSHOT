@@ -135,9 +135,11 @@ def _insert_ts_from_load_date(load_date: date):
 def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
                               cnt: int, start_time_py: datetime | None = None,
                               error_message: str | None = None) -> None:
-    insert_ts = _insert_ts_from_load_date(load_date)
-    start_ts = F.lit(start_time_py).cast("timestamp") if start_time_py else F.current_timestamp()
-    end_ts   = F.current_timestamp()
+    # Business-day anchored timestamps: all three equal to load_date @ 00:00:00 (CST/CDT)
+    insert_ts = F.to_timestamp(F.lit(str(load_date)))  # session TZ = America/Chicago
+    start_ts  = insert_ts
+    end_ts    = insert_ts
+
     row_df = (spark.range(1).select(
         F.lit(load_date).cast("date").alias("load_date"),
         F.lit(table_name).alias("table_name"),
@@ -149,8 +151,10 @@ def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
         end_ts.alias("end_time"),
         F.lit("incremental").alias("load_type"),
     ))
-    print(f"[{_ts()}] LOGS.snapshot_daily_log += table={table_name}, date={load_date}, status='{status}', count={cnt}")
+    print(f"[{_ts()}] LOGS.snapshot_daily_log += table={table_name}, date={load_date}, "
+          f"status='{status}', count={cnt} (times anchored to business date)")
     row_df.write.mode("append").saveAsTable("LOGS.snapshot_daily_log")
+
 
 def consolidate_snapshot_logs_to_final() -> None:
     """
