@@ -1,5 +1,6 @@
-# SNAPSHOT — CST/CDT; global-date logging; success=I/U/D rows (counts incl. 0); failure=single 'E'
-# Logs: load_date from staging (CST), insert_timestamp = load_date 00:00:00 CST; first-seen consolidation.
+# SNAPSHOT — CST/CDT; global-date planning; real runtime timestamps (hh:mm:ss) in logs.
+# Success path writes snapshot first, then logs D/I/U (counts can be 0). Failure writes a single 'E' row.
+# This version guarantees start_time, end_time, insert_timestamp are TIMESTAMPs in America/Chicago.
 
 from __future__ import annotations
 from datetime import datetime, date
@@ -18,9 +19,8 @@ from pyspark.sql.utils import AnalysisException
 # ------------------------
 spark = SparkSession.builder.appName("Apply Snapshot Tables - Global Dates (CST)").getOrCreate()
 
-# Use CST/CDT for all Spark timestamp rendering & arithmetic
+# Force CST/CDT for Spark session
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
@@ -38,7 +38,7 @@ SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"
 STAGING_SCHEMA = "staging"
 TABLES_LIST = "TABLES_LIST"  # columns: TABLE_NAME, KEY_COLUMN (comma-separated keys)
 
-# If staging insert_ts/insert_timestamp is UTC and should be localized to CST, set True.
+# If staging timestamps are UTC and must be localized to CST/CDT when landing in snapshot, set True.
 STAGING_TIMESTAMPS_ARE_UTC = True
 
 MAX_WORKERS = 4
@@ -62,16 +62,16 @@ def _resolve_insert_ts_col(df: DataFrame) -> str:
     for c in ("insert_timestamp", "insert_ts"):
         if c in cols:
             return cols[c]
-    raise ValueError("Insert timestamp column not found. Expected: insert_timestamp or insert_ts")
+    raise ValueError("Insert timestamp column not found. Expected one of: insert_timestamp, insert_ts")
 
 def _resolve_status_col(df: DataFrame) -> str:
     for c in df.columns:
         if c.lower() == "status":
             return c
-    raise ValueError("STATUS column not found.")
+    raise ValueError("STATUS column not found in staging.")
 
 def _to_cst_date_from_ts(col_name: str):
-    """Return CST/CDT date from a timestamp column, respecting STAGING_TIMESTAMPS_ARE_UTC."""
+    # Convert timestamp column to CST/CDT date for business-day filtering.
     if STAGING_TIMESTAMPS_ARE_UTC:
         return F.to_date(F.from_utc_timestamp(F.col(col_name), LOCAL_TZ_NAME))
     else:
@@ -81,20 +81,18 @@ def _staging_on_date(df: DataFrame, d: date) -> DataFrame:
     ts = _resolve_insert_ts_col(df)
     return df.where(_to_cst_date_from_ts(ts) == F.lit(str(d)).cast("date"))
 
-def _localize_staging_ts(df: DataFrame) -> DataFrame:
-    """Ensure staging timestamp column is in CST when writing to SNAPSHOT."""
-    ts_col = _resolve_insert_ts_col(df)
-    if STAGING_TIMESTAMPS_ARE_UTC:
-        return df.withColumn(ts_col, F.from_utc_timestamp(F.col(ts_col), LOCAL_TZ_NAME))
-    else:
-        return df
-
 def _convert_to_cst(df: DataFrame, ts_cols: List[str]) -> DataFrame:
     out = df
     for c in ts_cols:
         if c in out.columns:
             out = out.withColumn(c, F.from_utc_timestamp(F.col(c), LOCAL_TZ_NAME))
     return out
+
+# Build Spark TIMESTAMPs that are truly America/Chicago by pinning the instant at UTC,
+# then converting to LOCAL_TZ_NAME. This avoids UI/session ambiguities.
+def _lit_ts(dt_py: datetime):
+    utc_str = dt_py.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return F.from_utc_timestamp(F.to_timestamp(F.lit(utc_str)), LOCAL_TZ_NAME)
 
 # ------------------------
 # Logging (daily scratchpad → FINAL with first-seen policy)
@@ -105,9 +103,9 @@ snap_log_schema = T.StructType([
     T.StructField("status", T.StringType()),      # 'D','I','U' (success) or 'E' (failure)
     T.StructField("count", T.LongType()),
     T.StructField("error_message", T.StringType()),
-    T.StructField("insert_timestamp", T.TimestampType()),  # = load_date 00:00:00 CST
-    T.StructField("start_time", T.TimestampType()),        # runtime CST
-    T.StructField("end_time", T.TimestampType()),          # runtime CST
+    T.StructField("insert_timestamp", T.TimestampType()),  # actual write time (CST/CDT)
+    T.StructField("start_time", T.TimestampType()),        # real runtime (CST/CDT)
+    T.StructField("end_time", T.TimestampType()),          # real runtime (CST/CDT)
     T.StructField("load_type", T.StringType()),            # "incremental"
 ])
 
@@ -123,22 +121,38 @@ def ensure_snapshot_log_tables_exist() -> None:
     except Exception:
         spark.createDataFrame([], snap_log_schema).write.mode("overwrite").saveAsTable("LOGS.snapshot_final_log")
 
+# One-time/recurring guard: upgrade legacy DATE columns to TIMESTAMP so time-of-day is preserved.
+def _ensure_log_columns_are_timestamps():
+    for tbl in ["LOGS.snapshot_daily_log", "LOGS.snapshot_final_log"]:
+        df = spark.read.table(tbl)
+        fields = {f.name.lower(): f.dataType.simpleString() for f in df.schema.fields}
+        missing = [c for c in ["insert_timestamp", "start_time", "end_time"] if c not in fields]
+        if missing:
+            raise Exception(f"{tbl} missing required columns: {missing}")
+        needs_alter = any(fields[c] != "timestamp" for c in ["insert_timestamp", "start_time", "end_time"])
+        if needs_alter:
+            print(f"[{_ts()}] Altering {tbl} columns to TIMESTAMP for time precision.")
+            spark.sql(f"ALTER TABLE {tbl} ALTER COLUMN insert_timestamp TYPE TIMESTAMP")
+            spark.sql(f"ALTER TABLE {tbl} ALTER COLUMN start_time TYPE TIMESTAMP")
+            spark.sql(f"ALTER TABLE {tbl} ALTER COLUMN end_time TYPE TIMESTAMP")
+
 def reset_daily_log() -> None:
     ensure_snapshot_log_tables_exist()
+    _ensure_log_columns_are_timestamps()
     print(f"[{_ts()}] Truncating LOGS.snapshot_daily_log ...")
     spark.sql("TRUNCATE TABLE LOGS.snapshot_daily_log")
 
-def _insert_ts_from_load_date(load_date: date):
-    """insert_timestamp = midnight of load_date (CST/CDT)."""
-    return F.to_timestamp(F.lit(str(load_date)))  # session TZ => America/Chicago
-
-def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
-                              cnt: int, start_time_py: datetime | None = None,
+def append_snapshot_daily_log(table_name: str,
+                              load_date: date,
+                              status: str,
+                              cnt: int,
+                              start_time_py: datetime | None = None,
+                              end_time_py: datetime | None = None,
                               error_message: str | None = None) -> None:
-    # Business-day anchored timestamps: all three equal to load_date @ 00:00:00 (CST/CDT)
-    insert_ts = F.to_timestamp(F.lit(str(load_date)))  # session TZ = America/Chicago
-    start_ts  = insert_ts
-    end_ts    = insert_ts
+    now_py = datetime.now(tz)
+    insert_ts = _lit_ts(now_py)
+    start_ts  = _lit_ts(start_time_py or now_py)
+    end_ts    = _lit_ts(end_time_py   or now_py)
 
     row_df = (spark.range(1).select(
         F.lit(load_date).cast("date").alias("load_date"),
@@ -151,25 +165,20 @@ def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
         end_ts.alias("end_time"),
         F.lit("incremental").alias("load_type"),
     ))
-    print(f"[{_ts()}] LOGS.snapshot_daily_log += table={table_name}, date={load_date}, "
-          f"status='{status}', count={cnt} (times anchored to business date)")
+    print(f"[{_ts()}] LOG += {table_name} {load_date} status={status} count={cnt} "
+          f"(start/end/insert have real CST/CDT times)")
     row_df.write.mode("append").saveAsTable("LOGS.snapshot_daily_log")
 
-
 def consolidate_snapshot_logs_to_final() -> None:
-    """
-    First-seen policy: append only (load_date, table_name, status) not already present in FINAL.
-    Keeps original insert_timestamp stable across reruns.
-    """
-    print(f"[{_ts()}] Consolidating snapshot daily logs -> final (first-seen policy) ...")
+    print(f"[{_ts()}] Consolidating snapshot daily -> final (first-seen policy) ...")
     try:
         daily = spark.read.table("LOGS.snapshot_daily_log")
     except Exception:
-        print(f"[{_ts()}] No LOGS.snapshot_daily_log found; nothing to consolidate.")
+        print(f"[{_ts()}] No daily log found; nothing to consolidate.")
         return
 
     if daily.rdd.isEmpty():
-        print(f"[{_ts()}] LOGS.snapshot_daily_log is empty; truncating.")
+        print(f"[{_ts()}] Daily log empty; truncating and exiting consolidation.")
         spark.sql("TRUNCATE TABLE LOGS.snapshot_daily_log")
         return
 
@@ -184,38 +193,16 @@ def consolidate_snapshot_logs_to_final() -> None:
                     .join(existing_keys.alias("f"), on=keys, how="left_anti")
                     .select("d.*"))
 
-    print(f"[{_ts()}] FINAL before: {final_.count()} rows | DAILY new: {new_only.count()} rows")
+    print(f"[{_ts()}] FINAL before={final_.count()} | DAILY new={new_only.count()}")
     final_updated = final_.unionByName(new_only)
     final_updated.write.mode("overwrite").saveAsTable("LOGS.snapshot_final_log")
-    print(f"[{_ts()}] FINAL after:  {spark.read.table('LOGS.snapshot_final_log').count()} rows")
     spark.sql("TRUNCATE TABLE LOGS.snapshot_daily_log")
-    print(f"[{_ts()}] Consolidation complete.")
+    print(f"[{_ts()}] Consolidation done. FINAL now={spark.read.table('LOGS.snapshot_final_log').count()} rows")
 
 # ------------------------
-# Success detection (processed dates)
-# ------------------------
-def processed_success_dates(table_name: str) -> DataFrame:
-    """
-    A date is 'processed' iff FINAL logs have any of I/U/D rows for this table/date.
-    Failure rows ('E') do not count as processed.
-    """
-    try:
-        fl = spark.read.table("LOGS.snapshot_final_log")
-    except Exception:
-        print(f"[{_ts()}] FINAL logs not found; assuming nothing processed yet for {table_name}.")
-        return spark.createDataFrame([], T.StructType([T.StructField("load_date", T.DateType())]))
-    ok = (fl.filter((F.col("table_name") == table_name) & (F.col("status").isin("I","U","D")))
-            .select("load_date").distinct())
-    return ok
-
-# ------------------------
-# Global date helpers (so every table logs I/U/D=0 on those days)
+# Global date helpers
 # ------------------------
 def union_staging_dates_across_tables(tables: List[Dict[str, str]]) -> List[date]:
-    """
-    Return sorted unique CST business dates present in ANY staging table.
-    If none exist, return [today] so we still log I/U/D=0 per table.
-    """
     all_dates_df = None
     for r in tables:
         table = r["TABLE_NAME"]
@@ -229,15 +216,12 @@ def union_staging_dates_across_tables(tables: List[Dict[str, str]]) -> List[date
 
     if all_dates_df is None or all_dates_df.rdd.isEmpty():
         today = datetime.now(tz).date()
-        print(f"[{_ts()}] No dates in any staging table; defaulting to today={today}")
+        print(f"[{_ts()}] No staging dates found; defaulting to today={today}")
         return [today]
 
     return [r["load_date"] for r in all_dates_df.select("load_date").distinct().orderBy("load_date").collect()]
 
 def dates_to_process_for_table(table_name: str, candidate_dates: List[date]) -> List[date]:
-    """
-    From global candidate dates, remove dates already successful for this table (I/U/D in FINAL).
-    """
     try:
         fl = spark.read.table("LOGS.snapshot_final_log")
     except Exception:
@@ -255,47 +239,39 @@ def dates_to_process_for_table(table_name: str, candidate_dates: List[date]) -> 
 # CDC apply per (table, date)
 # ------------------------
 def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: date) -> None:
-    """
-    Apply CDC for one table & CST business date:
-      - DELETE: remove rows in snapshot whose keys appear with status='D'
-      - INSERT: append rows with status='I'
-      - UPDATE: append rows with status='U' (replace-by-key semantics via base_df)
-    Success path: write snapshot first, then log I/U/D with counts (zeros allowed).
-    Failure path: single 'E' log row (no I/U/D rows).
-    """
-    start_table_date = datetime.now(tz)
+    op_start = datetime.now(tz)
     print(f"[{_ts()}] === APPLY SNAPSHOT: table={table_name} | date={d} ===")
     try:
         stg_df = spark.read.table(stg_tbl(table_name))
-        print(f"[{_ts()}] Read staging table: {stg_tbl(table_name)}")
+        print(f"[{_ts()}] Read staging: {stg_tbl(table_name)}")
         status_col = _resolve_status_col(stg_df)
         stg_day = _staging_on_date(stg_df, d)
 
         day_count = stg_day.count()
-        print(f"[{_ts()}] Staging rows for {table_name} @ {d}: {day_count}")
+        print(f"[{_ts()}] Staging rows @ {d}: {day_count}")
 
         snap_table = snap_tbl(table_name)
         temp_table = snap_table.replace("_SNAPSHOT", "_TEMP")
 
-        # Ensure snapshot exists (seed from staging schema if missing)
+        # Ensure snapshot exists (seed empty schema from staging if missing)
         try:
             snap_df = spark.read.table(snap_table)
         except AnalysisException:
-            print(f"[{_ts()}] Snapshot missing for {table_name}, seeding empty schema from staging.")
+            print(f"[{_ts()}] Seed empty snapshot for {table_name}.")
             stg_df.limit(0).write.mode("overwrite").saveAsTable(snap_table)
             snap_df = spark.read.table(snap_table)
 
         snap_cols = snap_df.columns
 
         if day_count == 0:
-            # No rows today for this table — still log zeros and return (success)
-            print(f"[{_ts()}] No rows on {d} for {stg_tbl(table_name)}. Logging zeros.")
-            append_snapshot_daily_log(table_name, d, "D", 0, start_table_date, None)
-            append_snapshot_daily_log(table_name, d, "I", 0, start_table_date, None)
-            append_snapshot_daily_log(table_name, d, "U", 0, start_table_date, None)
+            op_end = datetime.now(tz)
+            print(f"[{_ts()}] No rows for {table_name} on {d}. Logging zeros.")
+            append_snapshot_daily_log(table_name, d, "D", 0, start_time_py=op_start, end_time_py=op_end)
+            append_snapshot_daily_log(table_name, d, "I", 0, start_time_py=op_start, end_time_py=op_end)
+            append_snapshot_daily_log(table_name, d, "U", 0, start_time_py=op_start, end_time_py=op_end)
             return
 
-        # -------- DELETE --------
+        # DELETE
         start_d = datetime.now(tz)
         d_keys = (stg_day.filter(F.upper(F.col(status_col)) == "D")
                          .select(*key_cols).dropDuplicates())
@@ -304,132 +280,125 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
                                  on=[F.col(f"t.{k}") == F.col(f"d.{k}") for k in key_cols],
                                  how="inner"))
         d_count = d_matches.count()
-        print(f"[{_ts()}] {table_name} {d} -> DELETE count (existing snapshot matches): {d_count}")
+        end_d = datetime.now(tz)
+        print(f"[{_ts()}] DELETE matches: {d_count}")
 
-        # Remove ANY keys touched today so we can re-add I and U fresh
+        # Remove any touched keys so I/U can re-add fresh
         touched_keys = stg_day.select(*key_cols).dropDuplicates()
         base_df = (snap_df.alias("t")
                           .join(touched_keys.alias("s"),
                                 on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
                                 how="left_anti"))
 
-        # -------- INSERT --------
+        # INSERT / UPDATE frames
         start_i = datetime.now(tz)
         i_df_raw = stg_day.filter(F.upper(F.col(status_col)) == "I").select(*snap_cols)
-        # -------- UPDATE --------
         start_u = datetime.now(tz)
         u_df_raw = stg_day.filter(F.upper(F.col(status_col)) == "U").select(*snap_cols)
 
-        # Normalize to CST if needed for common timestamp columns
         if STAGING_TIMESTAMPS_ARE_UTC:
             ts_like = [c for c in snap_cols if c.lower() in ("insert_ts","insert_timestamp","update_ts","load_ts")]
             i_df = _convert_to_cst(i_df_raw, ts_like)
             u_df = _convert_to_cst(u_df_raw, ts_like)
         else:
-            i_df = i_df_raw
-            u_df = u_df_raw
+            i_df, u_df = i_df_raw, u_df_raw
 
-        i_count = i_df.count()
-        u_count = u_df.count()
+        i_count = i_df.count(); end_i = datetime.now(tz)
+        u_count = u_df.count(); end_u = datetime.now(tz)
 
-        # Final dataframe for this date
         final_df = (base_df
                     .unionByName(i_df, allowMissingColumns=True)
                     .unionByName(u_df, allowMissingColumns=True))
 
-        # If no effective changes, still log zeros and return
+        # If no net effect, log zeros with real times and skip swap
         if d_count == 0 and i_count == 0 and u_count == 0:
-            print(f"[{_ts()}] {table_name} {d} -> No classified changes; skipping swap. Logging zeros.")
-            append_snapshot_daily_log(table_name, d, "D", 0, start_d, None)
-            append_snapshot_daily_log(table_name, d, "I", 0, start_i, None)
-            append_snapshot_daily_log(table_name, d, "U", 0, start_u, None)
+            print(f"[{_ts()}] No effective changes. Logging zeros; no swap.")
+            append_snapshot_daily_log(table_name, d, "D", 0, start_time_py=start_d, end_time_py=end_d)
+            append_snapshot_daily_log(table_name, d, "I", 0, start_time_py=start_i, end_time_py=end_i)
+            append_snapshot_daily_log(table_name, d, "U", 0, start_time_py=start_u, end_time_py=end_u)
             return
 
-        # Write TEMP & atomic swap
-        print(f"[{_ts()}] {table_name} {d} -> Writing TEMP {temp_table}")
+        # Write TEMP and atomically swap
+        print(f"[{_ts()}] Writing TEMP -> {temp_table}")
         final_df.write.mode("overwrite").saveAsTable(temp_table)
-        print(f"[{_ts()}] {table_name} {d} -> Replacing SNAPSHOT {snap_table}")
+        print(f"[{_ts()}] Swapping TEMP -> SNAPSHOT {snap_table}")
         spark.sql(f"DROP TABLE IF EXISTS {snap_table}")
         spark.sql(f"ALTER TABLE {temp_table} RENAME TO {snap_table}")
 
-        # SUCCESS logs (after successful write)
-        append_snapshot_daily_log(table_name, d, "D", d_count, start_d, None)
-        append_snapshot_daily_log(table_name, d, "I", i_count, start_i, None)
-        append_snapshot_daily_log(table_name, d, "U", u_count, start_u, None)
+        # Success logs
+        append_snapshot_daily_log(table_name, d, "D", d_count, start_time_py=start_d, end_time_py=end_d)
+        append_snapshot_daily_log(table_name, d, "I", i_count, start_time_py=start_i, end_time_py=end_i)
+        append_snapshot_daily_log(table_name, d, "U", u_count, start_time_py=start_u, end_time_py=end_u)
 
-        print(f"[{_ts()}] COMPLETE SNAPSHOT table={table_name} @ {d}  D={d_count}, I={i_count}, U={u_count}")
+        print(f"[{_ts()}] COMPLETE: {table_name} @ {d}  D={d_count}, I={i_count}, U={u_count}")
 
     except Exception as e:
         msg = f"{type(e).__name__}: {str(e)}"
         traceback.print_exc()
-        # FAILURE: single 'E' row; do not write I/U/D rows
-        append_snapshot_daily_log(table_name, d, "E", 0, start_table_date, msg)
-        print(f"[{_ts()}] FAILED SNAPSHOT {table_name} @ {d}\n{msg}")
+        op_end = datetime.now(tz)
+        append_snapshot_daily_log(table_name, d, "E", 0, start_time_py=op_start, end_time_py=op_end, error_message=msg)
+        print(f"[{_ts()}] FAILED: {table_name} @ {d} -> {msg}")
         raise
 
 # ------------------------
-# Orchestration (global dates; process only not-yet-successful per table)
+# Orchestration
 # ------------------------
 def _apply_with_retry_for_date(table_name: str, key_cols: List[str], d: date) -> None:
     attempts = 0
     while True:
         try:
-            print(f"[{_ts()}] Start SNAPSHOT {table_name} {d} (attempt {attempts + 1})")
+            print(f"[{_ts()}] Start {table_name} {d} (attempt {attempts+1})")
             apply_snapshot_for_table_and_date(table_name, key_cols, d)
-            print(f"[{_ts()}] Finished SNAPSHOT {table_name} {d}")
+            print(f"[{_ts()}] Finished {table_name} {d}")
             return
         except Exception:
             attempts += 1
             if attempts > MAX_RETRIES:
-                print(f"[{_ts()}] FINAL FAILURE SNAPSHOT {table_name} {d} after {attempts} attempts")
+                print(f"[{_ts()}] FINAL FAILURE {table_name} {d} after {attempts} attempts")
                 return
             print(f"[{_ts()}] RETRY in {SLEEP_BETWEEN_RETRIES}s for {table_name} {d}")
             time.sleep(SLEEP_BETWEEN_RETRIES)
 
 def process_all_snapshot() -> None:
-    print(f"[{_ts()}] ========= Starting snapshot apply (global dates; CST) =========")
+    print(f"[{_ts()}] ========= Start snapshot apply (global dates; CST/CDT) =========")
     ensure_snapshot_log_tables_exist()
-    reset_daily_log()
+    _ensure_log_columns_are_timestamps()
+    reset_daily_log()  # safe to truncate after ensuring TIMESTAMP types
 
     tables_df = spark.read.table(TABLES_LIST).select("TABLE_NAME", "KEY_COLUMN")
     all_rows = [r.asDict() for r in tables_df.collect()]
     print(f"[{_ts()}] Tables to scan: {len(all_rows)}")
 
-    # Build global dates (union across all staging tables)
     global_dates = union_staging_dates_across_tables(all_rows)
     print(f"[{_ts()}] Global candidate dates: {', '.join(map(str, global_dates))}")
 
     plan = {}
     total_pending = 0
-
     for r in all_rows:
         table = r["TABLE_NAME"]
         key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
-        print(f"[{_ts()}] -------- Planning table: {table} --------")
         pend = dates_to_process_for_table(table, global_dates)
         plan[table] = {"keys": key_cols, "pending": pend}
         total_pending += len(pend)
         if pend:
-            print(f"[{_ts()}] PLAN {table}: pending dates -> {', '.join(map(str, pend))}")
+            print(f"[{_ts()}] PLAN {table}: {', '.join(map(str, pend))}")
         else:
-            print(f"[{_ts()}] PLAN {table}: no pending dates (already successful in FINAL for global set).")
+            print(f"[{_ts()}] PLAN {table}: no pending dates.")
 
     if total_pending == 0:
-        print(f"[{_ts()}] Nothing pending across all tables. Consolidating logs and exiting.")
+        print(f"[{_ts()}] Nothing pending. Consolidating and exiting.")
         consolidate_snapshot_logs_to_final()
-        print(f"[{_ts()}] ========= All snapshot processing complete (no work) =========")
+        print(f"[{_ts()}] ========= Done (no work) =========")
         return
 
-    # Parallel across tables; per table, process dates serially
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = []
         for table, info in plan.items():
             dates = info["pending"]
             if not dates:
-                print(f"[{_ts()}] SKIP: {table} has no pending dates.")
                 continue
             def work(table=table, key_cols=info["keys"], dates=dates):
-                print(f"[{_ts()}] >>> Processing table {table}: {', '.join(map(str, dates))}")
+                print(f"[{_ts()}] >>> Processing {table}: {', '.join(map(str, dates))}")
                 for d in dates:
                     _apply_with_retry_for_date(table, key_cols, d)
             futures.append(ex.submit(work))
