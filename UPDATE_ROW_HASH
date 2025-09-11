@@ -1,77 +1,101 @@
-from pyspark.sql.functions import col, concat_ws, when, lit, trim, md5, regexp_replace
-from delta.tables import DeltaTable
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring, current_timestamp,upper
-from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
+from pyspark.sql import SparkSession, functions as F
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-import pytz
-import os
-import uuid
-import traceback
-from pyspark.sql.functions import col, concat_ws, when, lit, trim, regexp_replace, md5
+import pytz, traceback
 
-# === INIT SPARK SESSION ===
-spark = SparkSession.builder.appName("Update ROW_HASH for STAFF Demographics").getOrCreate()
+# --- INIT SPARK ---
+spark = SparkSession.builder.appName("Update ROW_HASH for RAW tables").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
 
-# --- CONFIG ---
 tz = pytz.timezone("America/Chicago")
-Today_date = datetime.now(tz).date()
+def _ts(): return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-# --- Step 1: Define target table ---
-raw_table_name = "MHMR_LAKEHOUSE.RAW.staff_current_demographics_RAW"
-target_table_name = raw_table_name.split(".")[-1]  # Extract table name only
-target_table_key = "staff_demographics"  # Update if needed
-exclude_cols = {
-    "ROW_HASH", "row_hash", "insert_timestamp", "INSERT_TIMESTAMP",
-    "UTCTimestamp", "STATUS", "status"
-}
+CATALOG = "MHMR_LAKEHOUSE"
+RAW_SCHEMA = f"{CATALOG}.RAW"
 
-# --- Step 2: Hashing function with invisible char cleanup ---
-def add_updated_row_hash(df):
-    cleaned_cols = [
-        upper(
-            regexp_replace(
-                when(col(f.name).isNull(), lit("")).otherwise(trim(col(f.name).cast("string"))),
-                r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',  # Control/invisible characters
-                ""
-            )
-        ).alias(f.name)
-        for f in df.schema.fields if f.name not in exclude_cols
-    ]
-    temp_df = df.select(*cleaned_cols)
-    sorted_cols = sorted(temp_df.columns)
-    hash_input = concat_ws("||", *[col(c) for c in sorted_cols])
-    return temp_df.withColumn("HASH_INPUT", hash_input).withColumn("ROW_HASH", md5(col("HASH_INPUT")))
+# --- Exclude columns from hashing ---
+EXCLUDE = {"ROW_HASH", "INSERT_TIMESTAMP", "UTCTimestamp", "STATUS"}
 
-# --- Step 3: Load and process the table ---
-if target_table_name == "staff_current_demographics_RAW":
+def _find_row_hash_name(cols):
+    for c in cols:
+        if c.upper() == "ROW_HASH":
+            return c
+    return None
+
+def build_hash_df(df, key_col):
+    """Return DataFrame with key and NEW_ROW_HASH column."""
+    exclude_upper = {c.upper() for c in EXCLUDE}
+    cols_keep = [f.name for f in df.schema.fields if f.name.upper() not in exclude_upper]
+
+    if key_col not in cols_keep:
+        cols_keep = [key_col] + [c for c in cols_keep if c != key_col]
+
+    cleaned = []
+    for c in cols_keep:
+        cleaned.append(
+            F.upper(
+                F.regexp_replace(
+                    F.when(F.col(c).isNull(), F.lit("")).otherwise(F.trim(F.col(c).cast("string"))),
+                    r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',
+                    ""
+                )
+            ).alias(c)
+        )
+
+    tmp = df.select(*cleaned)
+    ordered = sorted([c for c in tmp.columns if c != key_col])
+    hash_input = F.concat_ws("||", F.col(key_col), *[F.col(c) for c in ordered]) if ordered else F.col(key_col)
+    return tmp.select(F.col(key_col), F.md5(hash_input).alias("NEW_ROW_HASH"))
+
+def update_row_hash(table_name, key_col):
+    raw_tbl = f"{RAW_SCHEMA}.{table_name}_RAW"
     try:
-        df_raw = spark.read.format("delta").table(raw_table_name)
+        print(f"[{_ts()}] Reading RAW table: {raw_tbl}")
+        df_raw = spark.read.table(raw_tbl)
 
-        if target_table_key not in df_raw.columns:
-            raise ValueError(f"Key column '{target_table_key}' not found in table schema.")
+        if key_col not in df_raw.columns:
+            raise ValueError(f"Key column '{key_col}' not found in RAW table {raw_tbl}")
 
-        df_raw_updated = add_updated_row_hash(df_raw)
+        hash_df = build_hash_df(df_raw, key_col)
 
-        updated_df = df_raw.join(
-            df_raw_updated.select(target_table_key, "ROW_HASH"),
-            on=target_table_key,
-            how="left"
-        ).drop(df_raw["ROW_HASH"]).withColumnRenamed("ROW_HASH", "ROW_HASH")
+        # Drop existing ROW_HASH, join new one
+        row_hash_col = _find_row_hash_name(df_raw.columns)
+        base_cols = [c for c in df_raw.columns if c != row_hash_col] if row_hash_col else df_raw.columns
+        base_df = df_raw.select(*base_cols)
 
-        updated_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(raw_table_name)
+        joined = (
+            base_df.alias("b")
+            .join(hash_df.alias("h"), on=key_col, how="left")
+            .withColumn("ROW_HASH", F.col("h.NEW_ROW_HASH"))
+            .drop("NEW_ROW_HASH")
+        )
 
-        print(f"ROW_HASH updated successfully for table: {raw_table_name}")
+        print(f"[{_ts()}] Writing updated RAW table: {raw_tbl}")
+        (joined.write
+               .format("delta")
+               .mode("overwrite")
+               .option("overwriteSchema", "true")
+               .saveAsTable(raw_tbl))
 
+        print(f"[{_ts()}] ✅ ROW_HASH updated for {raw_tbl}")
     except Exception as e:
-        print(f"Error processing table {raw_table_name}: {str(e)}")
+        print(f"[{_ts()}] ❌ Failed {raw_tbl}: {e}")
+        traceback.print_exc()
 
-else:
-    print(f"No update needed for table: {raw_table_name}")
+def run_update(max_workers=4):
+    print(f"[{_ts()}] Reading TABLES_LIST …")
+    # Expect TABLES_LIST to have TABLE_NAME and KEY_COLUMN
+    tables_df = spark.read.table("TABLES_LIST")
+    rows = [r.asDict() for r in tables_df.collect()]
 
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(update_row_hash, r["TABLE_NAME"], r["KEY_COLUMN"]) for r in rows]
+        for f in as_completed(futs):
+            f.result()
+
+if __name__ == "__main__":
+    run_update(max_workers=4)
